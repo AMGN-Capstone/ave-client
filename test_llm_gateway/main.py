@@ -1,14 +1,15 @@
-import os
 from dotenv import load_dotenv
 from llm_gateway import LLMGateway
 
 # ==============================================================================
-PROVIDER = "gemini"
+PROVIDER = "deepseek" 
 
 if PROVIDER == "groq":
-    MODEL_NAME = "openai/gpt-oss-120b"
+    MODEL_NAME = "openai/gpt-oss-20b"
 elif PROVIDER == "gemini":
     MODEL_NAME = "gemini-3.5-flash"
+elif PROVIDER == "deepseek":
+    MODEL_NAME = "deepseek-v4-flash"
 
 TEMPERATURE = 0.7
 MAX_TOKENS = 1024
@@ -45,7 +46,7 @@ def main():
             print("대화를 종료합니다.")
             break
 
-        if PROVIDER == "groq":
+        if PROVIDER in ["groq", "deepseek"]:
             conversation_history.append({"role": "user", "content": user_input})
             payload_messages = conversation_history
         elif PROVIDER == "gemini":
@@ -63,7 +64,7 @@ def main():
         print(response)
         print("=" * 80)
 
-        if PROVIDER == "groq":
+        if PROVIDER in ["groq", "deepseek"]:
             conversation_history.append({"role": "assistant", "content": response})
         elif PROVIDER == "gemini":
             conversation_history.append(f"Model: {response}")

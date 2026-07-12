@@ -5,10 +5,12 @@
 - `.env` 파일을 생성하고 아래 내용을 작성하세요. API 호출을 위한 키로 사용됩니다. API 키는 아래 링크에서 획득하세요.
   - GROQ_API_KEY: [console.groq.com](https://console.groq.com/keys)
   - GEMINI_API_KEY: [aistudio.google.com](https://aistudio.google.com/api-keys)
+  - DEEPSEEK_API_KEY: [platform.deepseek.com](https://platform.deepseek.com/api_keys)
 
   ```env
   GROQ_API_KEY="<API_KEY>"
   GEMINI_API_KEY="<API_KEY>"
+  DEEPSEEK_API_KEY="<API_KEY>"
   ```
 
 - CMD에서 아래 명령어를 입력하여 가상 환경을 생성하세요.

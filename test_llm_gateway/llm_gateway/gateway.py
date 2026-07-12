@@ -1,6 +1,7 @@
 from typing import List, Dict
 from .providers.groq_client import GroqClient
 from .providers.gemini_client import GeminiClient
+from .providers.deepseek_client import DeepSeekClient
 
 class LLMGateway:
     def __init__(self, provider: str):
@@ -10,6 +11,8 @@ class LLMGateway:
             self.client = GroqClient()
         elif self.provider == "gemini":
             self.client = GeminiClient()
+        elif self.provider == "deepseek":
+            self.client = DeepSeekClient()
         else:
             raise ValueError(f"지원하지 않는 LLM 공급자입니다: {provider}")
 
