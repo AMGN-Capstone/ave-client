@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import shutil
@@ -51,16 +53,16 @@ class YouTubeImporter:
     def __init__(self, media_root: Path | None = None):
         self.media_root = media_root or get_media_root()
 
-    async def import_video(self, url: str) -> dict:
-        return await asyncio.to_thread(self._import_video_sync, url)
+    async def import_video(self, url: str, job_id: str | None = None) -> dict:
+        return await asyncio.to_thread(self._import_video_sync, url, job_id)
 
-    def _import_video_sync(self, url: str) -> dict:
+    def _import_video_sync(self, url: str, job_id: str | None = None) -> dict:
         if not is_youtube_url(url):
             raise InvalidYouTubeURLError("Only YouTube URLs are supported.")
         if YoutubeDL is None:
             raise YouTubeImportError("yt-dlp is not installed.")
 
-        job_id = uuid4().hex
+        job_id = job_id or uuid4().hex
         job_dir = self.media_root / "youtube" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 

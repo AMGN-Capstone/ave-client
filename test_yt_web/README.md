@@ -1,32 +1,63 @@
-# Longform Auto Editor MVP
+# Longform Auto Editor
 
-정보성 YouTube 풀영상과 사용자가 직접 올린 영상을 자동 편집 파이프라인의 입력 자료로 저장하는 최소 웹앱입니다.
+YouTube 링크를 받아 영상, 자막, 메타데이터를 수집하고 사용자별로 Supabase에 저장하는 FastAPI MVP입니다.
+
+## 현재 흐름
+
+1. 브라우저에서 Google 로그인
+2. Supabase Auth가 사용자 세션 발급
+3. 로그인 토큰을 FastAPI에 전달
+4. FastAPI가 토큰을 검증
+5. `yt-dlp`로 YouTube 영상과 자막 수집
+6. 영상·자막·메타데이터를 `longform-media` Storage에 저장
+7. `videos`, `processing_jobs`, `transcripts`에 사용자별 메타데이터 저장
+
+## 설치
+
+Python 3.10 이상을 권장합니다.
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+## 환경변수
+
+`token.env.example`을 복사해 `token.env`를 만들고 Supabase 값을 입력합니다.
+
+```env
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your-publishable-or-anon-key
+SUPABASE_SERVICE_ROLE_KEY=server-only-secret-key
+```
+
+`SUPABASE_SERVICE_ROLE_KEY`는 서버에서만 사용하며 브라우저 코드나 GitHub에 올리면 안 됩니다.
+
+## Supabase 설정
+
+1. `docs/supabase_schema.sql`을 Supabase SQL Editor에서 실행합니다.
+2. Authentication → Providers → Google에서 Google provider를 활성화합니다.
+3. Supabase URL Configuration에 다음 Redirect URL을 추가합니다.
+
+```text
+http://127.0.0.1:8000
+http://localhost:8000
+```
+
+4. Google Cloud OAuth Client의 Authorized redirect URI에는 Supabase Dashboard가 안내하는 callback URL을 입력합니다.
 
 ## 실행
 
 ```powershell
-python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload
 ```
 
-브라우저에서 `http://127.0.0.1:8000`을 열면 됩니다.
+브라우저에서 `http://127.0.0.1:8000`을 엽니다.
 
-## 현재 기능
+## API
 
-- `POST /api/youtube/import`: YouTube URL을 받아 `yt-dlp`로 영상, 자막, 메타데이터를 `media/youtube/<job_id>/`에 저장합니다.
-- `POST /api/videos/upload`: `mp4`, `mov`, `mkv`, `webm` 파일을 `media/uploads/`에 저장합니다.
-- `/`: YouTube URL 수집과 직접 영상 업로드를 수행하는 최소 화면을 제공합니다.
+- `GET /api/config`: 브라우저용 Supabase URL과 공개 키 반환
+- `GET /api/auth/me`: 로그인 토큰 검증
+- `POST /api/youtube/import`: 로그인 사용자의 YouTube 영상·스크립트 수집 및 저장
+- `POST /api/videos/upload`: 로컬 영상 업로드 MVP
 
-## 왜 API와 yt-dlp를 같이 쓰는가
-
-브라우저는 파일 선택과 URL 입력만 담당하고, 서버 API가 저장과 수집 작업을 담당하는 구조가 안전합니다. YouTube 원본 영상과 자막을 가져오는 단계는 공식 YouTube Data API보다 `yt-dlp`가 프로토타입에 적합합니다. YouTube Data API는 주로 영상 정보 조회, 채널/재생목록/업로드 관리에 쓰이고, 공개 영상 파일과 자동자막을 다운로드하는 용도에는 맞지 않습니다.
-
-`yt-dlp`는 영상 파일, 자동 생성 자막, 작성자가 올린 자막, 썸네일, 챕터, 설명 같은 자료를 가져올 수 있습니다. 이후 자동 편집 단계에서는 자막과 챕터를 기준으로 핵심 구간을 찾고, `ffmpeg`로 결과 영상을 만들면 됩니다.
-
-## 주의할 점
-
-- `ffmpeg`가 설치되어 있지 않으면 앱은 자동으로 단일 파일 포맷(`best[ext=mp4]/best`)을 받아서 병합 오류를 피합니다. 이 경우 화질이 낮아질 수 있고 화면의 `경고`에 표시됩니다.
-- 이후 자동 편집 단계에서는 컷 편집과 인코딩을 위해 `ffmpeg` 설치가 필요합니다.
-- YouTube가 자막 요청을 `HTTP 429 Too Many Requests`로 제한하면, 현재 앱은 자막 없이 영상과 메타데이터만 다시 수집하고 화면에 경고를 표시합니다.
-- 실제 서비스에서는 YouTube 약관, 저작권, 사용자의 이용 허가 범위를 반드시 검토해야 합니다.
-- 현재 구현은 MVP라서 수집 요청이 끝날 때까지 HTTP 요청을 유지합니다. 긴 영상 처리에는 작업 큐와 진행률 API를 붙이는 구조가 좋습니다.
+현재 YouTube 수집은 요청이 끝날 때까지 기다리는 동기 MVP입니다. 3시간 이상 라이브 영상에서는 다음 단계로 worker와 작업 상태 polling을 추가해야 합니다.

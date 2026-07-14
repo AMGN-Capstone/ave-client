@@ -3,3 +3,5 @@ python-multipart>=0.0.9
 uvicorn[standard]>=0.30.0
 yt-dlp>=2025.1.0
 pytest>=8.0.0
+supabase>=2.30.0
+python-dotenv>=1.0.0
