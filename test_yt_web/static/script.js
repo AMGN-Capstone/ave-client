@@ -1,8 +1,11 @@
 const apiStatus = document.querySelector("#apiStatus");
+const googleLoginButton = document.querySelector("#googleLoginButton");
+const logoutButton = document.querySelector("#logoutButton");
 const youtubeForm = document.querySelector("#youtubeForm");
-const uploadForm = document.querySelector("#uploadForm");
 const youtubeResult = document.querySelector("#youtubeResult");
-const uploadResult = document.querySelector("#uploadResult");
+
+let supabaseClient = null;
+let currentSession = null;
 
 function setStatus(text, state = "idle") {
   apiStatus.textContent = text;
@@ -11,18 +14,6 @@ function setStatus(text, state = "idle") {
 
 function setMessage(target, text, type = "success") {
   target.innerHTML = `<p class="message ${type}">${escapeHtml(text)}</p>`;
-}
-
-function renderDetails(target, rows) {
-  const content = rows
-    .filter(([, value]) => value !== undefined && value !== null && value !== "")
-    .map(([label, value]) => {
-      const printable = Array.isArray(value) ? value.join(", ") || "-" : String(value);
-      return `<div class="result-row"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(printable)}</dd></div>`;
-    })
-    .join("");
-
-  target.innerHTML = `<dl class="result-list">${content}</dl>`;
 }
 
 function escapeHtml(value) {
@@ -34,37 +25,77 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-async function parseResponse(response) {
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.detail || "요청을 처리하지 못했습니다.");
-  }
-  return data;
+function renderDetails(target, rows) {
+  const content = rows
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([label, value]) => `<div class="result-row"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(Array.isArray(value) ? value.join(", ") : value)}</dd></div>`)
+    .join("");
+  target.innerHTML = `<dl class="result-list">${content}</dl>`;
 }
+
+async function loadConfig() {
+  const response = await fetch("/api/config");
+  const config = await response.json();
+  if (!response.ok) throw new Error(config.detail || "Supabase 설정이 없습니다.");
+  supabaseClient = window.supabase.createClient(config.supabase_url, config.supabase_anon_key);
+  supabaseClient.auth.onAuthStateChange((_event, session) => updateAuthState(session));
+  const { data } = await supabaseClient.auth.getSession();
+  updateAuthState(data.session);
+}
+
+function updateAuthState(session) {
+  currentSession = session;
+  const loggedIn = Boolean(session?.user);
+  googleLoginButton.hidden = loggedIn;
+  logoutButton.hidden = !loggedIn;
+  setStatus(loggedIn ? `${session.user.email} 로그인됨` : "로그인 필요", loggedIn ? "success" : "idle");
+}
+
+googleLoginButton.addEventListener("click", async () => {
+  if (!supabaseClient) return;
+  const { error } = await supabaseClient.auth.signInWithOAuth({
+    provider: "google",
+    options: { redirectTo: window.location.origin },
+  });
+  if (error) setMessage(youtubeResult, error.message, "error");
+});
+
+logoutButton.addEventListener("click", async () => {
+  await supabaseClient.auth.signOut();
+  updateAuthState(null);
+});
 
 youtubeForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!currentSession?.access_token) {
+    setMessage(youtubeResult, "먼저 Google 로그인을 해주세요.", "error");
+    return;
+  }
+
   const submitButton = youtubeForm.querySelector("button");
   const url = new FormData(youtubeForm).get("url");
-
   submitButton.disabled = true;
   setStatus("YouTube 수집 중", "busy");
-  setMessage(youtubeResult, "수집 작업을 시작했습니다. 영상 길이에 따라 시간이 걸릴 수 있습니다.");
+  setMessage(youtubeResult, "영상 길이에 따라 시간이 걸릴 수 있습니다.");
 
   try {
     const response = await fetch("/api/youtube/import", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${currentSession.access_token}`,
+      },
       body: JSON.stringify({ url }),
     });
-    const data = await parseResponse(response);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || "수집에 실패했습니다.");
     renderDetails(youtubeResult, [
       ["작업 ID", data.job_id],
+      ["영상 ID", data.video_id],
+      ["스크립트 ID", data.transcript_id],
       ["제목", data.title],
-      ["길이", data.duration ? `${data.duration}초` : "-"],
-      ["영상 경로", data.video_path],
-      ["자막 파일", data.subtitle_files],
-      ["메타데이터", data.metadata_path],
+      ["영상 Storage 경로", data.video_path],
+      ["자막 Storage 경로", data.subtitle_files],
       ["경고", data.warnings],
     ]);
     setStatus("수집 완료", "success");
@@ -76,33 +107,7 @@ youtubeForm.addEventListener("submit", async (event) => {
   }
 });
 
-uploadForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const submitButton = uploadForm.querySelector("button");
-  const formData = new FormData(uploadForm);
-
-  submitButton.disabled = true;
-  setStatus("업로드 중", "busy");
-  setMessage(uploadResult, "파일을 서버에 저장하고 있습니다.");
-
-  try {
-    const response = await fetch("/api/videos/upload", {
-      method: "POST",
-      body: formData,
-    });
-    const data = await parseResponse(response);
-    renderDetails(uploadResult, [
-      ["원본 파일", data.original_filename],
-      ["저장 파일", data.stored_filename],
-      ["형식", data.content_type],
-      ["크기", `${data.size_bytes.toLocaleString()} bytes`],
-      ["저장 경로", data.path],
-    ]);
-    setStatus("업로드 완료", "success");
-  } catch (error) {
-    setMessage(uploadResult, error.message, "error");
-    setStatus("업로드 실패", "error");
-  } finally {
-    submitButton.disabled = false;
-  }
+loadConfig().catch((error) => {
+  setStatus("Supabase 설정 필요", "error");
+  setMessage(youtubeResult, error.message, "error");
 });
