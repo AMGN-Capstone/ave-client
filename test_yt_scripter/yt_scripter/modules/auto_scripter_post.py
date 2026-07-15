@@ -36,9 +36,10 @@ class AutoScripterPostProcessor:
 
             with open(csv_filepath, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Start Time', 'End Time', 'Text']) 
-                for row in processed_data:
-                    writer.writerow(row)
+                writer.writerow(['index', 'start', 'end', 'text']) 
+                
+                for index, row in enumerate(processed_data):
+                    writer.writerow([index] + row)
 
             return {"success": True, "csv_path": csv_filepath, "row_count": len(processed_data)}
 
