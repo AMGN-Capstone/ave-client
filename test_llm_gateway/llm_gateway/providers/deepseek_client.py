@@ -16,13 +16,17 @@ class DeepSeekClient:
 
     def generate(self, messages: List[Dict[str, str]], config: Dict[str, Any]) -> str:
         payload = {
-            "model": config.get("model"),
+            "model": config.get("model", "deepseek-chat"),
             "messages": messages,
-            "temperature": config.get("temperature"),
-            "max_tokens": config.get("max_tokens"),
-            "top_p": config.get("top_p"),
+            "temperature": config.get("temperature", 0.7),
             "stream": False
         }
+        
+        if "max_tokens" in config: payload["max_tokens"] = config["max_tokens"]
+        if "top_p" in config: payload["top_p"] = config["top_p"]
+        
+        if "response_format" in config: 
+            payload["response_format"] = config["response_format"]
 
         try:
             response = requests.post(self.url, headers=self.headers, json=payload)
