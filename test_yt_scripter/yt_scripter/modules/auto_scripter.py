@@ -22,6 +22,8 @@ class AutoScripter:
             if not video_id:
                 return {"error": "비디오 ID를 추출하지 못했습니다."}
 
+            target_file = os.path.join(target_dir, f"{video_id}_{lang}.txt")
+
             target_template = os.path.join(target_dir, f"{video_id}_auto.%(ext)s")
             
             dl_cmd = [
@@ -35,6 +37,11 @@ class AutoScripter:
             ]
             
             subprocess.run(dl_cmd, capture_output=True, text=True, check=True)
+
+            downloaded_file = os.path.join(target_dir, f"{video_id}_auto.{lang}.vtt")
+            
+            if os.path.exists(downloaded_file):
+                os.replace(downloaded_file, target_file)
             
             return {
                 "success": True,
