@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +18,12 @@ from app.schemas import (
     UploadVideoResponse,
     YouTubeImportRequest,
     YouTubeImportResponse,
+    LiveChatResponse,
+    LiveYouTubeRequest,
+    LiveFinalizeRequest,
+    LiveFinalizeResponse,
+    LiveEditRequest,
+    SubtitleUpdateRequest,
 )
 from app.services.supabase_service import (
     get_auth_client,
@@ -31,6 +38,19 @@ from app.services.youtube_importer import (
     YouTubeImporter,
     YouTubeImportError,
 )
+from app.services.live_youtube_service import (
+    LiveYouTubeError,
+    _chat_archive_path,
+    _read_chat_session,
+    _write_chat_session,
+    analyze_chat_archive,
+    collect_chat_replay,
+    extract_video_id,
+    get_live_broadcast,
+    get_live_chat,
+    get_video_metadata,
+)
+from app.services.live_edit_pipeline import LiveEditPipeline, LiveEditPipelineError
 
 
 SUPPORTED_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
@@ -40,6 +60,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 app = FastAPI(title="Longform Auto Editor MVP")
 auth_scheme = HTTPBearer(auto_error=False)
+LIVE_EDIT_JOBS: dict[str, dict] = {}
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -269,3 +290,292 @@ async def upload_video(file: UploadFile = File(...)):
         "size_bytes": size_bytes,
         "path": stored_path.resolve().as_posix(),
     }
+
+
+@app.post("/api/youtube/live/inspect")
+async def inspect_live_youtube(
+    request: LiveYouTubeRequest,
+    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
+):
+    try:
+        video_id = extract_video_id(request.url)
+        broadcast = get_live_broadcast(youtube_access_token, video_id)
+        # Chat is fetched by the separate polling endpoint below. Calling
+        # liveChatMessages here and immediately polling again can trigger
+        # YouTube's rateLimitExceeded response.
+        session = {
+            "broadcast_id": video_id,
+            "video_id": video_id,
+            "live_chat_id": broadcast.get("live_chat_id"),
+            "actual_start_time": broadcast.get("actual_start_time"),
+            "title": broadcast.get("title"),
+            "status": broadcast.get("life_cycle_status"),
+        }
+        if not broadcast.get("live_chat_id"):
+            session["warning"] = (
+                "활성 라이브 채팅이 없습니다. 방송 중에 먼저 추적을 시작해야 "
+                "다시보기와 결합할 채팅 데이터가 저장됩니다."
+            )
+        if broadcast.get("live_chat_id"):
+            _write_chat_session(broadcast["live_chat_id"], session)
+
+        return {"broadcast": broadcast, "session": session}
+    except LiveYouTubeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/youtube/live/chat", response_model=LiveChatResponse)
+async def live_youtube_chat(
+    live_chat_id: str = Query(..., min_length=1),
+    page_token: str | None = Query(default=None),
+    actual_start_time: str | None = Query(default=None),
+    delay_seconds: float = Query(default=0.0, ge=0, le=120),
+    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
+):
+    try:
+        return get_live_chat(
+            youtube_access_token,
+            live_chat_id,
+            page_token,
+            actual_start_time=actual_start_time,
+            delay_seconds=delay_seconds,
+        )
+    except LiveYouTubeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _update_live_edit_job(job_id: str, **values) -> None:
+    job = LIVE_EDIT_JOBS.get(job_id)
+    if job is not None:
+        job.update(values)
+
+
+async def _run_live_edit_job(
+    job_id: str,
+    request: LiveEditRequest,
+    youtube_access_token: str,
+) -> None:
+    try:
+        _update_live_edit_job(job_id, status="running", progress=3, message="다시보기 정보를 확인하는 중입니다.")
+        vod_id = extract_video_id(request.vod_url)
+        vod = get_video_metadata(youtube_access_token, vod_id)
+        archive_key = request.live_chat_id or f"vod-{vod_id}"
+        archive_path = _chat_archive_path(archive_key)
+
+        if not archive_path.exists() or archive_path.stat().st_size == 0:
+            _update_live_edit_job(job_id, progress=8, message="다시보기 채팅을 수집하는 중입니다.")
+            await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+
+        pipeline = LiveEditPipeline(get_media_root())
+        result = await asyncio.to_thread(
+            pipeline.run,
+            vod_url=request.vod_url,
+            archive_path=archive_path,
+            genre=request.genre,
+            actual_start_time=request.actual_start_time,
+            target_seconds=request.target_duration_seconds,
+            bucket_seconds=request.bucket_seconds,
+            delay_seconds=request.delay_seconds,
+            subtitle_offset_seconds=request.subtitle_offset_seconds,
+            subtitle_font_name=request.subtitle_font_name,
+            subtitle_font_size=request.subtitle_font_size,
+            render_mode=request.render_mode,
+            progress_callback=lambda progress, message: _update_live_edit_job(
+                job_id, progress=progress, message=message
+            ),
+        )
+        result["vod_video_id"] = vod_id
+        result["vod_title"] = vod.get("title")
+        result["vod_duration_iso"] = vod.get("duration_iso")
+        _update_live_edit_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="AI 영상 편집이 완료되었습니다.",
+            result=result,
+        )
+    except (LiveYouTubeError, LiveEditPipelineError) as exc:
+        _update_live_edit_job(job_id, status="failed", progress=100, message=str(exc), error=str(exc))
+    except Exception as exc:
+        _update_live_edit_job(
+            job_id,
+            status="failed",
+            progress=100,
+            message=f"AI 영상 편집에 실패했습니다: {exc}",
+            error=f"AI 영상 편집에 실패했습니다: {exc}",
+        )
+
+
+@app.post("/api/youtube/live/edit/start", status_code=202)
+async def start_live_edit(
+    request: LiveEditRequest,
+    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
+):
+    job_id = uuid4().hex
+    LIVE_EDIT_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "AI 편집 작업을 준비하는 중입니다.",
+    }
+    asyncio.create_task(_run_live_edit_job(job_id, request, youtube_access_token))
+    return LIVE_EDIT_JOBS[job_id]
+
+
+@app.get("/api/youtube/live/edit/status/{job_id}")
+async def live_edit_status(job_id: str):
+    job = LIVE_EDIT_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="AI 편집 작업을 찾을 수 없습니다.")
+    return job
+
+
+def _edit_output_dir(job_id: str) -> Path:
+    if not job_id or Path(job_id).name != job_id:
+        raise HTTPException(status_code=400, detail="잘못된 편집 작업 ID입니다.")
+    directory = get_media_root() / "youtube-live-edit" / job_id
+    if not directory.exists() or not directory.is_dir():
+        raise HTTPException(status_code=404, detail="편집 작업을 찾을 수 없습니다.")
+    return directory
+
+
+@app.get("/api/youtube/live/edit/{job_id}/subtitles")
+async def get_edit_subtitles(job_id: str):
+    subtitles = _edit_output_dir(job_id) / "subtitles.srt"
+    if not subtitles.exists():
+        raise HTTPException(status_code=404, detail="자막 파일을 찾을 수 없습니다.")
+    return {
+        "job_id": job_id,
+        "content": subtitles.read_text(encoding="utf-8-sig", errors="replace"),
+        "path": str(subtitles.resolve()),
+    }
+
+
+@app.put("/api/youtube/live/edit/{job_id}/subtitles")
+async def update_edit_subtitles(job_id: str, request: SubtitleUpdateRequest):
+    output_dir = _edit_output_dir(job_id)
+    subtitles = output_dir / "subtitles.srt"
+    subtitles.write_text(request.content, encoding="utf-8-sig")
+    pipeline = LiveEditPipeline(get_media_root())
+    try:
+        result = await asyncio.to_thread(pipeline.rerender_from_saved_subtitles, job_id)
+    except LiveEditPipelineError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if job_id in LIVE_EDIT_JOBS and LIVE_EDIT_JOBS[job_id].get("result"):
+        LIVE_EDIT_JOBS[job_id]["result"].update(result)
+    return {**result, "message": "자막을 저장하고 영상을 다시 생성했습니다."}
+
+
+@app.post("/api/youtube/live/edit")
+async def edit_live_youtube(
+    request: LiveEditRequest,
+    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
+):
+    """Create a Gemini-ranked, replay-chat-aware highlight video from a VOD."""
+
+    try:
+        vod_id = extract_video_id(request.vod_url)
+        vod = get_video_metadata(youtube_access_token, vod_id)
+        archive_key = request.live_chat_id or f"vod-{vod_id}"
+        archive_path = _chat_archive_path(archive_key)
+
+        # /finalize normally creates this archive first. The fallback makes
+        # this endpoint usable directly with a VOD URL as well.
+        if not archive_path.exists() or archive_path.stat().st_size == 0:
+            await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+
+        pipeline = LiveEditPipeline(get_media_root())
+        result = await asyncio.to_thread(
+            pipeline.run,
+            vod_url=request.vod_url,
+            archive_path=archive_path,
+            genre=request.genre,
+            actual_start_time=request.actual_start_time,
+            target_seconds=request.target_duration_seconds,
+            bucket_seconds=request.bucket_seconds,
+            delay_seconds=request.delay_seconds,
+            subtitle_offset_seconds=request.subtitle_offset_seconds,
+            subtitle_font_name=request.subtitle_font_name,
+            subtitle_font_size=request.subtitle_font_size,
+            render_mode=request.render_mode,
+        )
+        result["vod_video_id"] = vod_id
+        result["vod_title"] = vod.get("title")
+        result["vod_duration_iso"] = vod.get("duration_iso")
+        return result
+    except (LiveYouTubeError, LiveEditPipelineError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AI 영상 편집에 실패했습니다: {exc}") from exc
+
+
+@app.post("/api/youtube/live/finalize", response_model=LiveFinalizeResponse)
+async def finalize_live_youtube(
+    request: LiveFinalizeRequest,
+    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
+):
+    """Attach a completed VOD URL to the chat captured during the live event."""
+
+    try:
+        vod_id = extract_video_id(request.vod_url)
+        vod = get_video_metadata(youtube_access_token, vod_id)
+        archive_key = request.live_chat_id or f"vod-{vod_id}"
+        archive_path = _chat_archive_path(archive_key)
+        replay_warning = None
+
+        # Prefer replay timestamps from pytchat. If it is unavailable or the
+        # VOD has no replay, retain the official live-capture fallback.
+        try:
+            replay_result = await asyncio.to_thread(
+                collect_chat_replay,
+                vod_id,
+                archive_key,
+            )
+        except LiveYouTubeError as exc:
+            replay_result = None
+            replay_warning = str(exc)
+
+        has_archived_messages = archive_path.exists() and archive_path.stat().st_size > 0
+        if not has_archived_messages:
+            if replay_warning:
+                raise LiveYouTubeError(
+                    f"다시보기 채팅을 가져오지 못했고 저장된 라이브 채팅도 없습니다: {replay_warning}"
+                )
+            raise LiveYouTubeError("다시보기 채팅 데이터가 없습니다.")
+
+        analysis = analyze_chat_archive(
+            archive_key,
+            actual_start_time=request.actual_start_time,
+            duration_seconds=vod.get("duration_seconds"),
+            bucket_seconds=request.bucket_seconds,
+            delay_seconds=request.delay_seconds,
+        )
+        previous_session = _read_chat_session(archive_key)
+        session = {
+            "live_chat_id": archive_key,
+            "actual_start_time": request.actual_start_time or previous_session.get("actual_start_time"),
+            "vod_url": request.vod_url,
+            "vod_video_id": vod_id,
+            "vod_title": vod.get("title"),
+            "vod_duration_iso": vod.get("duration_iso"),
+            "chat_source": replay_result["source"] if replay_result else "live_capture_fallback",
+            "chat_warning": replay_warning,
+            "analysis": analysis,
+        }
+        _write_chat_session(archive_key, session)
+        return {
+            "vod_video_id": vod_id,
+            "vod_title": vod.get("title"),
+            "vod_duration_iso": vod.get("duration_iso"),
+            "chat_file_path": str(archive_path.resolve()),
+            "analysis": analysis,
+            "source_video_required": True,
+            "message": (
+                "채팅 분석이 완료되었습니다. pytchat 리플레이 시간을 기준으로 "
+                "하이라이트 후보를 생성했습니다."
+            ),
+        }
+    except LiveYouTubeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"다시보기 연결에 실패했습니다: {exc}") from exc

@@ -60,6 +60,19 @@ h1 {
   letter-spacing: 0;
 }
 
+.intro {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.account-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 h2 {
   margin-bottom: 4px;
   font-size: 20px;
@@ -189,6 +202,143 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.edit-progress {
+  margin: 14px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f4f8fb;
+  padding: 14px;
+}
+
+.progress-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+}
+
+.progress-track {
+  --progress: 0%;
+  height: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dce6ed;
+}
+
+.progress-track span {
+  display: block;
+  width: var(--progress);
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #1d6f64, #46b99e);
+  transition: width 0.45s ease;
+}
+
+.edit-progress[data-state="completed"] .progress-track span {
+  background: #238636;
+}
+
+.edit-progress[data-state="failed"] .progress-track span {
+  background: #c2413b;
+}
+
+.progress-message {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.settings-grid small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.subtitle-editor {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 14px;
+}
+
+.subtitle-editor-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+
+.subtitle-editor-heading h3 {
+  margin: 0;
+}
+
+.subtitle-editor-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.subtitle-editor textarea {
+  width: 100%;
+  min-height: 260px;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  font: 13px/1.5 Consolas, "Malgun Gothic", monospace;
+}
+
+.settings-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+input[type="number"] {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+  color: var(--ink);
+  padding: 8px 10px;
+}
+
+.json-result {
+  max-height: 360px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.chat-metrics {
+  display: flex;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.summary-label {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.highlight-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
 .muted {
   color: var(--muted);
 }
@@ -282,5 +432,9 @@ button:disabled {
   .result-row {
     grid-template-columns: 1fr;
     gap: 2px;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
   }
 }

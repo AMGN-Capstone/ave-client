@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,6 +27,27 @@ SUBTITLE_RATE_LIMIT_WARNING = (
 FFMPEG_MISSING_WARNING = (
     "ffmpeg is not installed. Downloaded a single-file video stream; "
     "quality may be lower."
+)
+YTDLP_CLIENT_FALLBACK_WARNING = (
+    "YouTube download required a fallback player client. "
+    "Set YTDLP_COOKIES_FROM_BROWSER or YTDLP_COOKIEFILE if 403 continues."
+)
+YTDLP_COOKIE_WARNING = (
+    "Browser cookie database could not be copied. "
+    "Close the browser completely or use YTDLP_COOKIEFILE."
+)
+YTDLP_COOKIE_403_WARNING = (
+    "YouTube rejected the cookie-authenticated stream with HTTP 403. "
+    "Retried the download without browser cookies."
+)
+YTDLP_DRM_WARNING = (
+    "YouTube marked this VOD as DRM protected. "
+    "yt-dlp cannot download the protected stream; use an authorized local source video."
+)
+YTDLP_STREAM_403_WARNING = (
+    "YouTube metadata was readable, but the video stream returned HTTP 403. "
+    "This is usually a player-client or PO Token restriction; use the web_embedded "
+    "client and keep yt-dlp[default] with Node/EJS installed."
 )
 
 
@@ -71,28 +94,12 @@ class YouTubeImporter:
         if not prefer_merged_formats:
             warnings.append(FFMPEG_MISSING_WARNING)
 
-        ydl_options = self._build_ydl_options(
+        info = self._download_with_fallbacks(
+            url,
             job_dir,
-            include_subtitles=True,
             prefer_merged_formats=prefer_merged_formats,
+            warnings=warnings,
         )
-
-        try:
-            info = self._download(url, ydl_options)
-        except Exception as exc:  # yt-dlp raises several custom exception types.
-            if not self._is_subtitle_rate_limit_error(exc):
-                raise YouTubeImportError(str(exc)) from exc
-
-            warnings.append(SUBTITLE_RATE_LIMIT_WARNING)
-            fallback_options = self._build_ydl_options(
-                job_dir,
-                include_subtitles=False,
-                prefer_merged_formats=prefer_merged_formats,
-            )
-            try:
-                info = self._download(url, fallback_options)
-            except Exception as fallback_exc:
-                raise YouTubeImportError(str(fallback_exc)) from fallback_exc
 
         subtitle_files = self._find_files(job_dir, SUBTITLE_EXTENSIONS)
         video_file = self._find_video_file(job_dir, info)
@@ -122,22 +129,125 @@ class YouTubeImporter:
         job_dir: Path,
         include_subtitles: bool,
         prefer_merged_formats: bool,
+        player_client: str | None = None,
+        use_cookies: bool = True,
     ) -> dict:
+        format_selector = os.getenv("YTDLP_FORMAT", "best[ext=mp4]/best").strip()
         options = {
-            "format": "bv*+ba/best" if prefer_merged_formats else "best[ext=mp4]/best",
+            # Prefer a progressive MP4 stream. YouTube may expose separate
+            # DASH streams whose URLs require a PO token and then return 403.
+            # Users can opt back into a higher-quality selector via env.
+            "format": format_selector or "best[ext=mp4]/best",
             "outtmpl": str(job_dir / "%(title).120s-%(id)s.%(ext)s"),
             "writeautomaticsub": include_subtitles,
             "writesubtitles": include_subtitles,
-            "subtitleslangs": ["ko", "en"] if include_subtitles else [],
+            # The editor only consumes Korean captions. Requesting English as
+            # well makes one rate-limited language fail the whole extraction.
+            "subtitleslangs": ["ko"] if include_subtitles else [],
             "subtitlesformat": "vtt",
             "writeinfojson": True,
             "writethumbnail": True,
             "quiet": True,
             "no_warnings": True,
+            "noplaylist": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "file_access_retries": 3,
+            "sleep_interval_requests": 1,
+            "http_chunk_size": 10 * 1024 * 1024,
+            # Current YouTube extraction requires an external JS runtime and
+            # the EJS challenge scripts. Node is installed with the project
+            # environment; explicitly enable it for the Python API just as
+            # the CLI would use --js-runtimes node.
+            "js_runtimes": {"node": {}},
         }
         if prefer_merged_formats:
             options["merge_output_format"] = "mp4"
+        if player_client:
+            options["extractor_args"] = {
+                "youtube": {"player_client": [player_client]}
+            }
+
+        cookie_file = os.getenv("YTDLP_COOKIEFILE", "").strip()
+        if use_cookies and cookie_file:
+            options["cookiefile"] = cookie_file
+        browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+        if use_cookies and browser and not cookie_file:
+            # yt-dlp expects (browser, profile, keyring, container).
+            options["cookiesfrombrowser"] = (browser, None, None, None)
+        user_agent = os.getenv("YTDLP_USER_AGENT", "").strip()
+        if user_agent:
+            options["http_headers"] = {"User-Agent": user_agent}
         return options
+
+    def _player_clients(self) -> list[str | None]:
+        configured = os.getenv("YTDLP_PLAYER_CLIENT", "web_embedded").strip()
+        # The tv client can report ordinary YouTube videos as DRM protected.
+        # Keep the fallback limited to the embedded client and yt-dlp default.
+        clients: list[str | None] = [configured or "web_embedded", None]
+        return list(dict.fromkeys(clients))
+
+    def _download_with_fallbacks(
+        self,
+        url: str,
+        job_dir: Path,
+        *,
+        prefer_merged_formats: bool,
+        warnings: list[str],
+    ) -> dict:
+        last_error: Exception | None = None
+        clients = self._player_clients()
+        cookies_disabled = False
+        for index, client in enumerate(clients):
+            options = self._build_ydl_options(
+                job_dir,
+                include_subtitles=True,
+                prefer_merged_formats=prefer_merged_formats,
+                player_client=client,
+                use_cookies=not cookies_disabled,
+            )
+            try:
+                return self._download(url, options)
+            except Exception as exc:  # yt-dlp exposes several custom errors.
+                last_error = exc
+                if self._is_drm_error(exc) and index < len(clients) - 1:
+                    continue
+                if self._is_cookie_database_error(exc) and not cookies_disabled:
+                    warnings.append(YTDLP_COOKIE_WARNING)
+                    cookies_disabled = True
+                    continue
+                # A valid browser cookie can still make YouTube select a
+                # protected/expired format. Retry the same client without
+                # cookies before switching to another player client.
+                if self._is_forbidden_error(exc) and not cookies_disabled:
+                    warnings.append(YTDLP_COOKIE_403_WARNING)
+                    cookies_disabled = True
+                    continue
+                if self._is_subtitle_rate_limit_error(exc):
+                    warnings.append(SUBTITLE_RATE_LIMIT_WARNING)
+                    fallback_options = self._build_ydl_options(
+                        job_dir,
+                        include_subtitles=False,
+                        prefer_merged_formats=prefer_merged_formats,
+                        player_client=client,
+                        use_cookies=not cookies_disabled,
+                    )
+                    try:
+                        return self._download(url, fallback_options)
+                    except Exception as fallback_exc:
+                        last_error = fallback_exc
+                if self._is_forbidden_error(last_error) and index < len(clients) - 1:
+                    warnings.append(YTDLP_CLIENT_FALLBACK_WARNING)
+                    continue
+                if index < len(clients) - 1:
+                    continue
+        if self._is_drm_error(last_error):
+            message = YTDLP_DRM_WARNING
+        elif self._is_forbidden_error(last_error):
+            message = YTDLP_STREAM_403_WARNING
+        else:
+            message = self._clean_error(str(last_error or "unknown yt-dlp error"))
+        raise YouTubeImportError(message) from last_error
 
     def _download(self, url: str, ydl_options: dict) -> dict:
         with YoutubeDL(ydl_options) as downloader:
@@ -152,6 +262,22 @@ class YouTubeImporter:
             "Unable to download video subtitles" in message
             and ("429" in message or "Too Many Requests" in message)
         )
+
+    def _is_forbidden_error(self, exc: Exception | None) -> bool:
+        return "403" in str(exc or "") or "Forbidden" in str(exc or "")
+
+    def _is_cookie_database_error(self, exc: Exception | None) -> bool:
+        message = str(exc or "").lower()
+        return (
+            "could not copy chrome cookie database" in message
+            or "could not copy" in message and "cookie database" in message
+        )
+
+    def _is_drm_error(self, exc: Exception | None) -> bool:
+        return "drm protected" in str(exc or "").lower()
+
+    def _clean_error(self, message: str) -> str:
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", message).strip()
 
     def _write_metadata(
         self,

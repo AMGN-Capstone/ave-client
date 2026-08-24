@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -36,3 +38,53 @@ class UploadVideoResponse(BaseModel):
     content_type: str | None = None
     size_bytes: int
     path: str
+
+
+class LiveYouTubeRequest(BaseModel):
+    url: str = Field(..., min_length=1)
+
+
+class LiveChatResponse(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+    next_page_token: str | None = None
+    polling_interval_millis: int = 5000
+    offline_at: str | None = None
+    chat_file_path: str | None = None
+    total_messages: int = 0
+    highlight_windows: list[dict] = Field(default_factory=list)
+
+
+class LiveFinalizeRequest(BaseModel):
+    live_chat_id: str | None = Field(default=None, min_length=1)
+    vod_url: str = Field(..., min_length=1)
+    actual_start_time: str | None = None
+    bucket_seconds: int = Field(default=30, ge=5, le=300)
+    delay_seconds: float = Field(default=0.0, ge=0, le=120)
+
+
+class LiveFinalizeResponse(BaseModel):
+    vod_video_id: str
+    vod_title: str | None = None
+    vod_duration_iso: str | None = None
+    chat_file_path: str | None = None
+    analysis: dict
+    source_video_required: bool = True
+    message: str
+
+
+class LiveEditRequest(BaseModel):
+    live_chat_id: str | None = Field(default=None, min_length=1)
+    vod_url: str = Field(..., min_length=1)
+    genre: Literal["ai_news", "stock", "game"] = "ai_news"
+    actual_start_time: str | None = None
+    target_duration_seconds: int = Field(default=600, ge=60, le=3600)
+    bucket_seconds: int = Field(default=30, ge=5, le=300)
+    delay_seconds: float = Field(default=0.0, ge=0, le=120)
+    subtitle_offset_seconds: float = Field(default=-4.0, ge=-120, le=120)
+    subtitle_font_name: str = Field(default="Malgun Gothic", min_length=1, max_length=100)
+    subtitle_font_size: int = Field(default=18, ge=8, le=64)
+    render_mode: str = Field(default="preview", pattern="^(preview|exact)$")
+
+
+class SubtitleUpdateRequest(BaseModel):
+    content: str = Field(default="", max_length=2_000_000)
