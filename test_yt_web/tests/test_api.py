@@ -59,8 +59,9 @@ def test_frontend_index_is_served():
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "YouTube URL" in response.text
-    assert "Google로 로그인" in response.text
+    assert "라이브 채팅 기반 자동 편집" in response.text
+    assert "다시보기와 분석 결합" in response.text
+    assert "Google 로그인" in response.text
 
 
 def test_upload_video_saves_supported_file(tmp_path, monkeypatch):

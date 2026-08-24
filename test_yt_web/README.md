@@ -196,3 +196,38 @@ python -m uvicorn app.main:app --reload
 - `POST /api/videos/upload`: 로컬 영상 업로드 MVP
 
 현재 YouTube 수집은 요청이 끝날 때까지 기다리는 동기 MVP입니다. 3시간 이상 영상에서는 다음 단계로 worker와 작업 상태 polling을 추가해야 합니다.
+
+## 라이브 채팅 기반 자동 편집 흐름
+
+새 라이브 기능은 일반 댓글과 자막 수집을 사용하지 않습니다.
+
+1. Google 로그인 후 YouTube 읽기 권한을 허용합니다.
+2. 방송 중인 라이브 URL을 `http://127.0.0.1:8000`의 `방송 중 채팅 수집`에 입력합니다.
+3. 서버가 `activeLiveChatId`를 확인하고 `liveChatMessages.list`를 주기적으로 호출합니다.
+4. 채팅은 `media/youtube-live-chat/<live_chat_id>.jsonl`에 중복 없이 누적 저장됩니다.
+5. 방송 종료 후 다시보기 URL을 `다시보기 결합`에 입력합니다.
+6. 서버는 `pytchat`으로 다시보기 채팅 리플레이를 우선 수집합니다.
+7. `pytchat`이 실패하면 방송 중 저장한 공식 API JSONL을 fallback으로 사용합니다.
+8. 리플레이의 `elapsedTime` 또는 저장된 채팅 작성 시각을 기준으로 30초 구간별 채팅량과 급증 구간을 계산합니다.
+9. `highlight_windows`를 영상 편집기의 컷 후보 입력으로 사용합니다.
+
+다시보기 URL은 메타데이터와 채팅 리플레이 수집에 사용됩니다. 실제 자동 편집에는 사용자가 권리를 보유한 원본 영상 파일을 `/api/videos/upload`로 업로드하거나, 별도 승인된 영상 입력을 사용해야 합니다. `pytchat`은 비공식 라이브러리이며 저장소가 보관 처리된 상태이므로 YouTube 변경에 따라 작동하지 않을 수 있습니다.
+
+### 로컬 실행
+
+프로젝트 루트에서 다음 명령을 실행합니다.
+
+```powershell
+cd test_yt_web
+..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+그 다음 브라우저에서 `http://127.0.0.1:8000`을 열고 Google 로그인 → 라이브 URL 입력 → 방송 종료 후 다시보기 URL 입력 순서로 진행합니다.
+
+### 주요 API
+
+- `POST /api/youtube/live/inspect`: 라이브 메타데이터와 활성 채팅 ID 확인
+- `GET /api/youtube/live/chat`: 다음 채팅 페이지 수집 및 로컬 JSONL 저장
+- `POST /api/youtube/live/finalize`: pytchat 리플레이 우선 수집 및 저장된 채팅 fallback 분석
+- `POST /api/videos/upload`: 편집에 사용할 권한 있는 원본 영상 업로드
