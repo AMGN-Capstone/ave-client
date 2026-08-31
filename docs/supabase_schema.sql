@@ -1,4 +1,4 @@
--- Longform Auto Editor - Supabase schema
+-- Automatic Video Editor - Supabase schema
 -- Run this file in Supabase SQL Editor.
 
 create extension if not exists pgcrypto;

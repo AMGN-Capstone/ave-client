@@ -73,18 +73,22 @@ class LiveFinalizeResponse(BaseModel):
 
 
 class LiveEditRequest(BaseModel):
-    live_chat_id: str | None = Field(default=None, min_length=1)
-    vod_url: str = Field(..., min_length=1)
+    vod_url: str = Field(..., min_length=1, description="이미 업로드된 YouTube 영상 URL")
     genre: Literal["ai_news", "stock", "game"] = "ai_news"
-    actual_start_time: str | None = None
     target_duration_seconds: int = Field(default=600, ge=60, le=3600)
-    bucket_seconds: int = Field(default=30, ge=5, le=300)
-    delay_seconds: float = Field(default=0.0, ge=0, le=120)
-    subtitle_offset_seconds: float = Field(default=-4.0, ge=-120, le=120)
+    chat_delay_seconds: float = Field(default=0.0, ge=-120, le=120)
+    clean_subtitles: bool = Field(default=False, description="AI 자막 정제 실행 여부")
+    subtitle_offset_seconds: float = Field(default=0.0, ge=-120, le=120)
     subtitle_font_name: str = Field(default="Malgun Gothic", min_length=1, max_length=100)
     subtitle_font_size: int = Field(default=18, ge=8, le=64)
     render_mode: str = Field(default="preview", pattern="^(preview|exact)$")
+    interactive_selection: bool = True
 
 
 class SubtitleUpdateRequest(BaseModel):
     content: str = Field(default="", max_length=2_000_000)
+
+
+class SegmentSelectionRequest(BaseModel):
+    segment_ids: list[str] = Field(..., min_length=1, max_length=500)
+    feedback: str | None = Field(default=None, max_length=2_000)

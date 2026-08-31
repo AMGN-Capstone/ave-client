@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from app.config import get_media_root
@@ -82,11 +82,17 @@ class YouTubeImporter:
     def _import_video_sync(self, url: str, job_id: str | None = None) -> dict:
         if not is_youtube_url(url):
             raise InvalidYouTubeURLError("Only YouTube URLs are supported.")
+        job_id = job_id or uuid4().hex
+        cached = self._find_complete_cached_import(url, job_id)
+        if cached is not None:
+            return cached
         if YoutubeDL is None:
             raise YouTubeImportError("yt-dlp is not installed.")
 
-        job_id = job_id or uuid4().hex
-        job_dir = self.media_root / "youtube" / job_id
+        video_id = self._video_id_from_url(url)
+        # A video ID is stable across edit jobs. Keeping newly imported assets
+        # here makes later edit requests reuse both the source and its VTT.
+        job_dir = self.media_root / "youtube" / f"cache-{video_id or job_id}"
         job_dir.mkdir(parents=True, exist_ok=True)
 
         prefer_merged_formats = self._has_ffmpeg()
@@ -122,6 +128,77 @@ class YouTubeImporter:
             "subtitle_files": [relative_to_cwd(path) for path in subtitle_files],
             "metadata_path": relative_to_cwd(metadata_path),
             "warnings": warnings,
+        }
+
+    @staticmethod
+    def _video_id_from_url(url: str) -> str | None:
+        """Return a conservative YouTube ID without contacting YouTube."""
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host == "youtu.be":
+            candidate = parsed.path.strip("/").split("/", 1)[0]
+        elif parsed.path.startswith("/watch"):
+            candidate = parse_qs(parsed.query).get("v", [""])[0]
+        elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+            candidate = parsed.path.strip("/").split("/", 1)[1] if "/" in parsed.path.strip("/") else ""
+        else:
+            candidate = ""
+        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate or "") else None
+
+    def _find_complete_cached_import(self, url: str, job_id: str) -> dict | None:
+        """Reuse an existing source only when both video and captions exist."""
+
+        video_id = self._video_id_from_url(url)
+        if not video_id:
+            return None
+        root = self.media_root / "youtube"
+        if not root.exists():
+            return None
+
+        candidates = [root / f"cache-{video_id}"]
+        # Older revisions used edit-{job_id}; retain their downloaded assets.
+        candidates.extend(path for path in root.iterdir() if path.is_dir() and path not in candidates)
+        matches: list[tuple[float, Path, Path, list[Path], dict]] = []
+        for directory in candidates:
+            metadata_path = directory / "metadata.json"
+            metadata: dict = {}
+            if metadata_path.exists():
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    metadata = {}
+            known_id = self._video_id_from_url(str(metadata.get("source_url") or metadata.get("webpage_url") or ""))
+            # Legacy metadata may not contain a parseable URL, but yt-dlp file
+            # names retain the video ID.
+            if known_id != video_id and video_id not in directory.name and not any(video_id in path.name for path in directory.iterdir() if path.is_file()):
+                continue
+            subtitles = self._find_files(directory, SUBTITLE_EXTENSIONS)
+            subtitles = [
+                path
+                for path in subtitles
+                if path.suffix.lower() == ".vtt" and path.stat().st_size > 0
+            ]
+            video = self._find_video_file(directory, metadata)
+            if video is None or not video.exists() or video.stat().st_size <= 0 or not subtitles:
+                continue
+            newest = max([video.stat().st_mtime, *(path.stat().st_mtime for path in subtitles)])
+            matches.append((newest, directory, video, subtitles, metadata))
+        if not matches:
+            return None
+
+        _, directory, video, subtitles, metadata = max(matches, key=lambda item: item[0])
+        metadata_path = directory / "metadata.json"
+        return {
+            "job_id": job_id,
+            "source_url": url,
+            "title": metadata.get("title"),
+            "duration": metadata.get("duration"),
+            "video_path": relative_to_cwd(video),
+            "subtitle_files": [relative_to_cwd(path) for path in subtitles],
+            "metadata_path": relative_to_cwd(metadata_path) if metadata_path.exists() else "",
+            "warnings": ["Reused existing source video and subtitles for this YouTube video."],
+            "cache_hit": True,
         }
 
     def _build_ydl_options(

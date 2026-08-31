@@ -626,7 +626,8 @@ def _transcribe_downloaded_audio(url: str, job_dir: Path) -> dict:
 
     try:
         from yt_dlp import YoutubeDL
-        from app.services.local_video_transcriber import transcribe_video, transcript_as_text
+        from app.services.local_video_transcriber import transcript_as_text
+        from app.services.transcription_service import transcribe_media
     except ImportError as exc:
         raise LiveYouTubeError(
             "로컬 STT를 사용하려면 yt-dlp와 faster-whisper를 설치하세요."
@@ -647,7 +648,7 @@ def _transcribe_downloaded_audio(url: str, job_dir: Path) -> dict:
     if not audio_files:
         raise LiveYouTubeError("오디오 파일을 찾지 못했습니다.")
 
-    transcript = transcribe_video(audio_files[0])
+    transcript = transcribe_media(audio_files[0])
     return {
         "title": info.get("title"),
         "channel": info.get("channel") or info.get("uploader"),

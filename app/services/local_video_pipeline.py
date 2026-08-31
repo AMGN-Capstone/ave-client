@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.services.gemini_editor import GeminiEditor
-from app.services.local_video_transcriber import transcribe_video
+from app.services.transcription_service import transcribe_media
 
 
 def analyze_local_video(
@@ -17,13 +17,15 @@ def analyze_local_video(
     whisper_device: str | None = None,
     whisper_compute_type: str | None = None,
     gemini_model: str | None = None,
+    transcription_provider: str | None = None,
 ) -> dict[str, Any]:
-    transcript = transcribe_video(
+    transcript = transcribe_media(
         video_path,
         model_size=whisper_model,
         language=language,
         device=whisper_device,
         compute_type=whisper_compute_type,
+        provider=transcription_provider,
     )
     edit_plan = GeminiEditor(model=gemini_model).create_edit_plan(transcript)
     return {"transcript": transcript, "edit_plan": edit_plan}

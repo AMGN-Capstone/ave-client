@@ -23,6 +23,7 @@ from app.schemas import (
     LiveFinalizeRequest,
     LiveFinalizeResponse,
     LiveEditRequest,
+    SegmentSelectionRequest,
     SubtitleUpdateRequest,
 )
 from app.services.supabase_service import (
@@ -58,9 +59,10 @@ CHUNK_SIZE = 1024 * 1024
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
-app = FastAPI(title="Longform Auto Editor MVP")
+app = FastAPI(title="Automatic Video Editor MVP")
 auth_scheme = HTTPBearer(auto_error=False)
 LIVE_EDIT_JOBS: dict[str, dict] = {}
+EDIT_JOB_LOCKS: dict[str, asyncio.Lock] = {}
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -353,47 +355,63 @@ def _update_live_edit_job(job_id: str, **values) -> None:
 async def _run_live_edit_job(
     job_id: str,
     request: LiveEditRequest,
-    youtube_access_token: str,
 ) -> None:
     try:
-        _update_live_edit_job(job_id, status="running", progress=3, message="다시보기 정보를 확인하는 중입니다.")
+        _update_live_edit_job(job_id, status="running", progress=3, message="업로드된 영상을 확인하는 중입니다.")
         vod_id = extract_video_id(request.vod_url)
-        vod = get_video_metadata(youtube_access_token, vod_id)
-        archive_key = request.live_chat_id or f"vod-{vod_id}"
+        archive_key = f"vod-{vod_id}"
         archive_path = _chat_archive_path(archive_key)
 
         if not archive_path.exists() or archive_path.stat().st_size == 0:
-            _update_live_edit_job(job_id, progress=8, message="다시보기 채팅을 수집하는 중입니다.")
-            await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+            _update_live_edit_job(job_id, progress=8, message="지원되는 채팅 리플레이를 확인하는 중입니다.")
+            try:
+                await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+            except LiveYouTubeError:
+                # Chat replay is an optional signal. A completed video without
+                # replay chat must still be editable from its transcript.
+                pass
 
         pipeline = LiveEditPipeline(get_media_root())
         result = await asyncio.to_thread(
             pipeline.run,
+            job_id=job_id,
             vod_url=request.vod_url,
             archive_path=archive_path,
             genre=request.genre,
-            actual_start_time=request.actual_start_time,
+            actual_start_time=None,
             target_seconds=request.target_duration_seconds,
-            bucket_seconds=request.bucket_seconds,
-            delay_seconds=request.delay_seconds,
+            chat_delay_seconds=request.chat_delay_seconds,
+            clean_subtitles=request.clean_subtitles,
+            delay_seconds=0.0,
             subtitle_offset_seconds=request.subtitle_offset_seconds,
             subtitle_font_name=request.subtitle_font_name,
             subtitle_font_size=request.subtitle_font_size,
             render_mode=request.render_mode,
+            defer_render=request.interactive_selection,
             progress_callback=lambda progress, message: _update_live_edit_job(
                 job_id, progress=progress, message=message
             ),
         )
         result["vod_video_id"] = vod_id
-        result["vod_title"] = vod.get("title")
-        result["vod_duration_iso"] = vod.get("duration_iso")
-        _update_live_edit_job(
-            job_id,
-            status="completed",
-            progress=100,
-            message="AI 영상 편집이 완료되었습니다.",
-            result=result,
-        )
+        result["chat_replay_used"] = archive_path.exists() and archive_path.stat().st_size > 0
+        if result.get("awaiting_selection"):
+            _update_live_edit_job(
+                job_id,
+                status="awaiting_selection",
+                progress=100,
+                phase="selection",
+                message="AI 분석이 완료되었습니다. 원하는 구간을 선택하세요.",
+                result=result,
+            )
+        else:
+            _update_live_edit_job(
+                job_id,
+                status="completed",
+                progress=100,
+                phase="render",
+                message="AI 영상 편집이 완료되었습니다.",
+                result=result,
+            )
     except (LiveYouTubeError, LiveEditPipelineError) as exc:
         _update_live_edit_job(job_id, status="failed", progress=100, message=str(exc), error=str(exc))
     except Exception as exc:
@@ -406,28 +424,94 @@ async def _run_live_edit_job(
         )
 
 
-@app.post("/api/youtube/live/edit/start", status_code=202)
+@app.post("/api/youtube/edit/start", status_code=202)
+@app.post("/api/youtube/live/edit/start", status_code=202, deprecated=True)
 async def start_live_edit(
     request: LiveEditRequest,
-    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
 ):
     job_id = uuid4().hex
     LIVE_EDIT_JOBS[job_id] = {
         "job_id": job_id,
         "status": "queued",
         "progress": 0,
+        "phase": "analysis",
         "message": "AI 편집 작업을 준비하는 중입니다.",
     }
-    asyncio.create_task(_run_live_edit_job(job_id, request, youtube_access_token))
+    asyncio.create_task(_run_live_edit_job(job_id, request))
     return LIVE_EDIT_JOBS[job_id]
 
 
-@app.get("/api/youtube/live/edit/status/{job_id}")
+@app.get("/api/youtube/edit/status/{job_id}")
+@app.get("/api/youtube/live/edit/status/{job_id}", deprecated=True)
 async def live_edit_status(job_id: str):
     job = LIVE_EDIT_JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="AI 편집 작업을 찾을 수 없습니다.")
     return job
+
+
+async def _run_segment_selection_job(
+    job_id: str,
+    request: SegmentSelectionRequest,
+) -> None:
+    lock = EDIT_JOB_LOCKS.setdefault(job_id, asyncio.Lock())
+    async with lock:
+        previous_result = dict(LIVE_EDIT_JOBS.get(job_id, {}).get("result") or {})
+        try:
+            _update_live_edit_job(
+                job_id,
+                status="running",
+                progress=0,
+                phase="render",
+                message="사용자가 선택한 구간으로 편집을 준비하는 중입니다.",
+            )
+            pipeline = LiveEditPipeline(get_media_root())
+            result = await asyncio.to_thread(
+                pipeline.rerender_from_selection,
+                job_id,
+                request.segment_ids,
+                feedback=request.feedback,
+                progress_callback=lambda progress, message: _update_live_edit_job(
+                    job_id,
+                    progress=progress,
+                    message=message,
+                ),
+            )
+            merged_result = {
+                **previous_result,
+                **result,
+                "awaiting_selection": False,
+            }
+            _update_live_edit_job(
+                job_id,
+                status="completed",
+                progress=100,
+                phase="render",
+                message="선택한 구간으로 영상을 다시 만들었습니다.",
+                result=merged_result,
+                error=None,
+            )
+        except LiveEditPipelineError as exc:
+            _update_live_edit_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="render",
+                message=str(exc),
+                error=str(exc),
+                result=previous_result,
+            )
+        except Exception as exc:
+            message = f"선택 구간 렌더링에 실패했습니다: {exc}"
+            _update_live_edit_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="render",
+                message=message,
+                error=message,
+                result=previous_result,
+            )
 
 
 def _edit_output_dir(job_id: str) -> Path:
@@ -439,7 +523,82 @@ def _edit_output_dir(job_id: str) -> Path:
     return directory
 
 
-@app.get("/api/youtube/live/edit/{job_id}/subtitles")
+@app.get("/api/youtube/edit/{job_id}/segments")
+@app.get("/api/youtube/live/edit/{job_id}/segments", deprecated=True)
+async def get_edit_segments(job_id: str):
+    _edit_output_dir(job_id)
+    pipeline = LiveEditPipeline(get_media_root())
+    try:
+        return pipeline.get_segment_review(job_id)
+    except LiveEditPipelineError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/api/youtube/edit/{job_id}/segments", status_code=202)
+@app.put("/api/youtube/live/edit/{job_id}/segments", status_code=202, deprecated=True)
+async def update_edit_segments(job_id: str, request: SegmentSelectionRequest):
+    _edit_output_dir(job_id)
+    current = LIVE_EDIT_JOBS.get(job_id)
+    if current and current.get("phase") == "render" and current.get("status") in {
+        "queued",
+        "running",
+    }:
+        raise HTTPException(status_code=409, detail="이미 선택 구간을 렌더링하고 있습니다.")
+    if current is None:
+        LIVE_EDIT_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "phase": "render",
+            "message": "선택 구간 렌더링을 준비하는 중입니다.",
+        }
+    else:
+        current.update(
+            {
+                "status": "queued",
+                "progress": 0,
+                "phase": "render",
+                "message": "선택 구간 렌더링을 준비하는 중입니다.",
+                "error": None,
+            }
+        )
+    asyncio.create_task(_run_segment_selection_job(job_id, request))
+    return LIVE_EDIT_JOBS[job_id]
+
+
+@app.get("/api/youtube/edit/{job_id}/media/{kind}")
+@app.get("/api/youtube/live/edit/{job_id}/media/{kind}", deprecated=True)
+async def get_edit_media(job_id: str, kind: str):
+    output_dir = _edit_output_dir(job_id)
+    plan_path = output_dir / "edit_plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="편집 계획 파일을 찾을 수 없습니다.") from exc
+
+    if kind == "source":
+        media_path = Path(str(plan.get("source_video_path", "")))
+        if not media_path.is_absolute():
+            media_path = (Path.cwd() / media_path).resolve()
+    elif kind == "rendered":
+        render_mode = str(plan.get("render_mode", "preview"))
+        filename = str(plan.get("rendered_filename") or f"edited-{render_mode}.mp4")
+        if Path(filename).name != filename:
+            raise HTTPException(status_code=404, detail="저장된 영상 경로가 올바르지 않습니다.")
+        media_path = output_dir / filename
+    else:
+        raise HTTPException(status_code=404, detail="지원하지 않는 영상 종류입니다.")
+    if not media_path.exists() or not media_path.is_file():
+        raise HTTPException(status_code=404, detail="영상 파일을 찾을 수 없습니다.")
+    return FileResponse(
+        media_path,
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/youtube/edit/{job_id}/subtitles")
+@app.get("/api/youtube/live/edit/{job_id}/subtitles", deprecated=True)
 async def get_edit_subtitles(job_id: str):
     subtitles = _edit_output_dir(job_id) / "subtitles.srt"
     if not subtitles.exists():
@@ -451,7 +610,8 @@ async def get_edit_subtitles(job_id: str):
     }
 
 
-@app.put("/api/youtube/live/edit/{job_id}/subtitles")
+@app.put("/api/youtube/edit/{job_id}/subtitles")
+@app.put("/api/youtube/live/edit/{job_id}/subtitles", deprecated=True)
 async def update_edit_subtitles(job_id: str, request: SubtitleUpdateRequest):
     output_dir = _edit_output_dir(job_id)
     subtitles = output_dir / "subtitles.srt"
@@ -466,23 +626,25 @@ async def update_edit_subtitles(job_id: str, request: SubtitleUpdateRequest):
     return {**result, "message": "자막을 저장하고 영상을 다시 생성했습니다."}
 
 
-@app.post("/api/youtube/live/edit")
+@app.post("/api/youtube/edit")
+@app.post("/api/youtube/live/edit", deprecated=True)
 async def edit_live_youtube(
     request: LiveEditRequest,
-    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
 ):
-    """Create a Gemini-ranked, replay-chat-aware highlight video from a VOD."""
+    """Create a Gemini-ranked highlight video from an uploaded YouTube VOD."""
 
     try:
         vod_id = extract_video_id(request.vod_url)
-        vod = get_video_metadata(youtube_access_token, vod_id)
-        archive_key = request.live_chat_id or f"vod-{vod_id}"
+        archive_key = f"vod-{vod_id}"
         archive_path = _chat_archive_path(archive_key)
 
-        # /finalize normally creates this archive first. The fallback makes
-        # this endpoint usable directly with a VOD URL as well.
+        # Replay chat is optional. Its absence must not block transcript-led
+        # editing of an already uploaded video.
         if not archive_path.exists() or archive_path.stat().st_size == 0:
-            await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+            try:
+                await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+            except LiveYouTubeError:
+                pass
 
         pipeline = LiveEditPipeline(get_media_root())
         result = await asyncio.to_thread(
@@ -490,18 +652,18 @@ async def edit_live_youtube(
             vod_url=request.vod_url,
             archive_path=archive_path,
             genre=request.genre,
-            actual_start_time=request.actual_start_time,
+            actual_start_time=None,
             target_seconds=request.target_duration_seconds,
-            bucket_seconds=request.bucket_seconds,
-            delay_seconds=request.delay_seconds,
+            chat_delay_seconds=request.chat_delay_seconds,
+            clean_subtitles=request.clean_subtitles,
+            delay_seconds=0.0,
             subtitle_offset_seconds=request.subtitle_offset_seconds,
             subtitle_font_name=request.subtitle_font_name,
             subtitle_font_size=request.subtitle_font_size,
             render_mode=request.render_mode,
         )
         result["vod_video_id"] = vod_id
-        result["vod_title"] = vod.get("title")
-        result["vod_duration_iso"] = vod.get("duration_iso")
+        result["chat_replay_used"] = archive_path.exists() and archive_path.stat().st_size > 0
         return result
     except (LiveYouTubeError, LiveEditPipelineError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

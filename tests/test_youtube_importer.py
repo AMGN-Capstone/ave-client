@@ -5,6 +5,36 @@ from app.services import youtube_importer
 from app.services.youtube_importer import YouTubeImporter
 
 
+def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "youtube" / "cache-abc123"
+    cache_dir.mkdir(parents=True)
+    video = cache_dir / "sample-abc123.mp4"
+    subtitle = cache_dir / "sample-abc123.ko.vtt"
+    video.write_bytes(b"existing video")
+    subtitle.write_text("WEBVTT\n", encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "source_url": "https://www.youtube.com/watch?v=abc123",
+                "title": "Cached video",
+                "duration": 60,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(youtube_importer, "YoutubeDL", None)
+
+    result = YouTubeImporter(tmp_path)._import_video_sync(
+        "https://www.youtube.com/watch?v=abc123", job_id="new-edit-job"
+    )
+
+    assert result["job_id"] == "new-edit-job"
+    assert result["title"] == "Cached video"
+    assert result["cache_hit"] is True
+    assert Path(result["video_path"]).resolve() == video.resolve()
+    assert [Path(path).resolve() for path in result["subtitle_files"]] == [subtitle.resolve()]
+
+
 class SubtitleRateLimitedYoutubeDL:
     calls = []
 

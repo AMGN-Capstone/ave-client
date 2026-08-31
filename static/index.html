@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Automatic Video Editor</title>
+    <link rel="icon" type="image/png" href="/static/ave-favicon.png">
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Automatic Video Editor</p>
+        <h1>업로드 완료 영상 자동 편집</h1>
+        <p class="intro">이미 업로드된 YouTube 영상을 자막으로 분석하고, 채팅 리플레이가 지원되면 구간별 시청자 반응도 함께 표시합니다.</p>
+      </div>
+      <div class="account-area">
+        <span class="status-pill" id="apiStatus">Supabase 연결 확인 중</span>
+        <button id="googleLoginButton" type="button">Google 로그인</button>
+        <button id="logoutButton" type="button" hidden>로그아웃</button>
+        <button id="themeToggleButton" class="theme-toggle" type="button" aria-label="다크 모드로 전환" title="다크 모드로 전환"><span aria-hidden="true">🌙</span></button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="tool-panel primary-panel phase-panel" id="analysisPhase" data-phase="analysis" aria-labelledby="editTitle">
+        <div class="section-heading">
+          <span class="step-index">01</span>
+          <div>
+            <h2 id="editTitle">영상 분석 및 편집 후보 만들기</h2>
+            <p>이미 업로드된 YouTube 영상 URL을 입력하세요. 채팅 리플레이가 지원되면 자동 수집해 스크립트 구간별 밀도를 표시하며, 없으면 자막 분석만으로 계속 진행합니다.</p>
+          </div>
+        </div>
+
+        <form id="editForm" class="stacked-form">
+          <label for="editVodUrl">업로드 완료된 YouTube 영상 URL</label>
+          <input id="editVodUrl" name="vod_url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" required>
+          <div class="settings-grid">
+            <label>
+              <span class="setting-title">영상 장르</span>
+              <span class="setting-content"><select id="editGenre" name="genre">
+                <option value="ai_news">AI 뉴스</option>
+                <option value="stock">주식·증시</option>
+                <option value="game">게임</option>
+              </select></span>
+            </label>
+            <label>
+              <span class="setting-title">채팅 지연 보정(초)</span>
+              <span class="setting-content"><span class="range-number-control">
+                <input id="chatDelaySecondsRange" type="range" min="-120" max="120" step="0.1" value="0">
+                <input id="chatDelaySeconds" name="chat_delay_seconds" type="number" min="-120" max="120" step="0.1" value="0">
+              </span>
+              <small>양수는 채팅 시각을 더 이르게 맞춥니다. 밀도는 각 스크립트 구간에서 계산합니다.</small>
+              </span>
+            </label>
+            <label class="checkbox-label">
+              <span class="setting-content">
+                <span class="setting-title">AI로 자막 오타·중복 정제</span>
+                <small>끄면 원본 자막을 그대로 사용해 LLM 호출을 줄입니다.</small>
+              </span>
+              <input id="cleanSubtitles" name="clean_subtitles" type="checkbox" role="switch" aria-label="AI로 자막 오타·중복 정제">
+            </label>
+            <label>
+              <span class="setting-title">자막 싱크 보정(초)</span>
+              <span class="setting-content"><span class="range-number-control">
+                <input id="subtitleOffsetSecondsRange" type="range" min="-120" max="120" step="0.1" value="0">
+                <input id="subtitleOffsetSeconds" name="subtitle_offset_seconds" type="number" min="-120" max="120" step="0.1" value="0">
+              </span>
+              <small>양수는 자막을 더 일찍 표시합니다.</small>
+              </span>
+            </label>
+            <label>
+              <span class="setting-title">자막 폰트</span>
+              <span class="setting-content"><input id="subtitleFontName" name="subtitle_font_name" type="text" value="Malgun Gothic" maxlength="100"></span>
+            </label>
+            <label>
+              <span class="setting-title">자막 크기</span>
+              <span class="setting-content"><span class="range-number-control">
+                <input id="subtitleFontSizeRange" type="range" min="8" max="64" step="1" value="18">
+                <input id="subtitleFontSize" name="subtitle_font_size" type="number" min="8" max="64" value="18">
+              </span></span>
+            </label>
+            <label>
+              <span class="setting-title">목표 길이(초)</span>
+              <span class="setting-content"><span class="range-number-control">
+                <input id="targetDurationSecondsRange" type="range" min="60" max="3600" step="10" value="600">
+                <input id="targetDurationSeconds" name="target_duration_seconds" type="number" min="60" max="3600" step="10" value="600">
+              </span></span>
+            </label>
+            <label>
+              <span class="setting-title">렌더링 방식</span>
+              <span class="setting-content"><select id="renderMode" name="render_mode">
+                <option value="preview">preview (빠른 확인)</option>
+                <option value="exact">exact (정확한 컷)</option>
+              </select></span>
+            </label>
+          </div>
+          <div class="phase-actions">
+            <button id="startAnalysisButton" type="button" class="secondary-button"><span class="button-long">다음: AI 분석 및 후보 만들기</span><span class="button-short">다음</span></button>
+          </div>
+        </form>
+      </section>
+
+      <section class="tool-panel edit-review-panel phase-panel" id="segmentReviewer" data-phase="review" aria-labelledby="segmentReviewTitle" hidden>
+        <div class="section-heading">
+          <span class="step-index">02</span>
+          <div>
+            <h2 id="segmentReviewTitle">구간 검토 및 영상 생성</h2>
+            <p>AI 추천을 시작점으로 사용하고, 원본을 미리 보면서 포함할 구간을 직접 선택하세요.</p>
+          </div>
+        </div>
+
+        <div class="segment-review-layout">
+          <div class="video-review-column">
+            <div class="video-card">
+              <div class="video-card-heading">
+                <h3>원본 구간 미리보기</h3>
+                <span id="previewRangeLabel" class="muted">구간의 미리보기를 누르세요.</span>
+              </div>
+              <video id="sourcePreview" controls preload="metadata"></video>
+            </div>
+          </div>
+
+          <div class="segment-selection-column">
+            <div class="selection-toolbar">
+              <div class="selection-metrics" aria-live="polite">
+                <strong><span id="selectedSegmentCount">0</span>개 선택</strong>
+                <span>예상 길이 <strong id="selectedDuration">00:00:00</strong></span>
+                <span id="targetDurationFeedback" class="muted"></span>
+              </div>
+              <div class="selection-actions">
+                <button id="selectRecommendedButton" type="button" class="ghost-button">AI 추천</button>
+                <button id="selectAllSegmentsButton" type="button" class="ghost-button">전체 선택</button>
+                <button id="clearSegmentsButton" type="button" class="ghost-button">전체 해제</button>
+              </div>
+            </div>
+
+            <div class="review-stage-heading">
+              <span class="review-stage-index">1</span>
+              <div>
+                <h3>챕터 선택</h3>
+                <p><span id="chapterCount">0</span>개 챕터로 요약했습니다. 원하는 주제를 고르고 세부 구간을 바로 펼쳐 조정하세요.</p>
+              </div>
+            </div>
+            <div id="chapterList" class="chapter-list" role="group" aria-label="AI 요약 챕터"></div>
+
+            <label class="feedback-field" for="segmentFeedback">
+              편집 피드백 <span class="optional-label">선택 사항</span>
+              <textarea id="segmentFeedback" rows="1" maxlength="2000" placeholder="예: 제품 발표 부분은 유지하고 반복 설명은 제외해 주세요."></textarea>
+            </label>
+
+            <div class="selection-footer">
+              <p id="segmentReviewMessage" class="progress-message" aria-live="polite"></p>
+              <div class="phase-actions">
+                <button id="backToAnalysisButton" type="button" class="ghost-button"><span class="button-long">이전: 분석 설정</span><span class="button-short">이전</span></button>
+                <button id="renderSelectedButton" type="button" class="secondary-button" disabled><span class="button-long">다음: 선택 구간으로 영상 생성</span><span class="button-short">다음</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tool-panel phase-panel" id="renderPhase" data-phase="render" aria-labelledby="renderTitle" hidden>
+        <div class="section-heading">
+          <span class="step-index">03</span>
+          <div>
+            <h2 id="renderTitle">렌더링 결과 및 자막 수정</h2>
+            <p>선택 구간으로 만든 영상을 확인하고, 필요하면 SRT 자막을 수정해 다시 생성하세요.</p>
+          </div>
+        </div>
+        <div class="video-card" id="renderedPreviewCard" hidden>
+          <div class="video-card-heading">
+            <h3>현재 편집 결과</h3>
+            <span id="renderedRevisionLabel" class="muted"></span>
+          </div>
+          <video id="renderedPreview" controls preload="metadata"></video>
+        </div>
+        <div class="subtitle-editor" id="subtitleEditor" hidden>
+          <div class="subtitle-editor-heading">
+            <div>
+              <h3>자막 수정</h3>
+              <p>SRT의 문장이나 시간 코드를 수정한 뒤 저장하면 영상을 다시 생성합니다.</p>
+            </div>
+            <div class="subtitle-editor-actions">
+              <button id="saveSubtitleButton" type="button" class="secondary-button">자막 저장 및 영상 재생성</button>
+              <a id="downloadRenderedButton" class="secondary-button download-button" hidden download>영상 저장</a>
+            </div>
+          </div>
+          <div class="subtitle-table-wrap">
+            <table class="subtitle-table">
+              <thead>
+                <tr><th>번호</th><th>시작</th><th>종료</th><th>자막</th></tr>
+              </thead>
+              <tbody id="subtitleTableBody"></tbody>
+            </table>
+          </div>
+          <p id="subtitleEditorMessage" class="progress-message"></p>
+        </div>
+        <div class="phase-actions">
+          <button id="backToReviewButton" type="button" class="ghost-button"><span class="button-long">이전: 구간 검토</span><span class="button-short">이전</span></button>
+          <button id="restartAnalysisButton" type="button" class="ghost-button"><span class="button-long">처음으로</span><span class="button-short">처음</span></button>
+        </div>
+      </section>
+    </main>
+
+    <div id="progressDock" class="progress-dock">
+    <aside id="editProgress" class="edit-progress floating-progress" aria-live="polite">
+      <div class="progress-status">
+        <div class="progress-heading">
+          <strong id="editProgressLabel">AI 편집 진행률</strong>
+          <strong id="editProgressPercent">0%</strong>
+        </div>
+        <div id="editProgressBar" class="progress-track" role="progressbar" aria-label="AI 영상 편집 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span></span>
+        </div>
+        <p id="editProgressMessage" class="progress-message">작업을 준비하는 중입니다.</p>
+      </div>
+      <div class="progress-spacer" aria-hidden="true"></div>
+      <div id="footerActions" class="footer-actions"></div>
+    </aside>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="/static/script.js"></script>
+    <script>
+      (() => {
+        const button = document.querySelector("#startAnalysisButton");
+        const actions = button?.closest(".phase-actions");
+        const footer = document.querySelector("#footerActions");
+        if (actions && footer) footer.replaceChildren(actions);
+        if (button && !button.dataset.analysisBound) {
+          button.addEventListener("click", (event) => {
+            event.preventDefault();
+            if (!document.querySelector("#editForm")?.reportValidity()) return;
+            window.startAnalysis?.(event);
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>
