@@ -71,6 +71,21 @@
             </label>
             <label>
               <span class="setting-title">자막 싱크 보정(초)</span>
+              <span class="setting-content"><span class="range-number-control"></span></span>
+            </label>
+            <label>
+              <span class="setting-title">STT 소스</span>
+              <span class="setting-content"><select id="transcriptionSource" name="transcription_source">
+                <option value="youtube_caption">YouTube 자막 사용</option>
+                <option value="whisper_api">AVE Whisper API 사용</option>
+              </select><small>Whisper API는 배포된 클라이언트의 공개 HTTPS 주소가 설정된 경우 사용할 수 있습니다.</small></span>
+            </label>
+            <label class="stt-option" hidden><span class="setting-title">Whisper 언어</span><span class="setting-content"><input name="stt_language" type="text" value="ko" maxlength="20"></span></label>
+            <label class="stt-option" hidden><span class="setting-title">초기 프롬프트</span><span class="setting-content"><input name="stt_initial_prompt" type="text" maxlength="1000" placeholder="고유명사·주제 등을 입력하세요"></span></label>
+            <label class="stt-option" hidden><span class="setting-title">핫워드</span><span class="setting-content"><input name="stt_hotwords" type="text" maxlength="1000" placeholder="쉼표로 구분"></span></label>
+            <label class="stt-option" hidden><span class="setting-title">전사 배속</span><span class="setting-content"><input name="stt_speed" type="number" min="1" max="4" step="0.1" value="1"></span></label>
+            <label>
+              <span class="setting-title">자막 싱크 보정(초)</span>
               <span class="setting-content"><span class="range-number-control">
                 <input id="subtitleOffsetSecondsRange" type="range" min="-120" max="120" step="0.1" value="0">
                 <input id="subtitleOffsetSeconds" name="subtitle_offset_seconds" type="number" min="-120" max="120" step="0.1" value="0">

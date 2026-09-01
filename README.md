@@ -257,3 +257,21 @@ AI 분석 작업은 기본적으로 영상을 바로 렌더링하지 않고 `awa
 - `PUT /api/youtube/edit/{job_id}/segments`: 사용자 선택으로 백그라운드 재렌더 시작
 - `GET /api/youtube/edit/{job_id}/media/source`: 원본 미리보기 스트리밍
 - `GET /api/youtube/edit/{job_id}/media/rendered`: 최신 편집 결과 스트리밍
+
+### AVE Whisper API 사용
+
+영상 분석 화면의 `STT 소스`에서 `AVE Whisper API 사용`을 선택하면 YouTube 자막 대신 배포된 `ave-whisper-api`로 전사합니다. `token.env`에 다음 값을 설정해야 합니다.
+
+```env
+WHISPER_RUNPOD_ENDPOINT_ID=<RunPod Queue Endpoint ID>
+RUNPOD_API_KEY=<RunPod API key>
+WHISPER_RUNPOD_TIMEOUT_SECONDS=3600
+AZURE_MEDIA_SFTP_HOST=
+AZURE_MEDIA_SFTP_PORT=
+AZURE_MEDIA_SFTP_USER=
+AZURE_MEDIA_SFTP_KEY_PATH=
+AZURE_MEDIA_SSH_KNOWN_HOSTS=
+AZURE_MEDIA_PUBLIC_BASE_URL=
+```
+
+Whisper를 선택하면 `yt-dlp`로 수집한 원본에서 음원을 추출해 Azure VM의 SFTP 저장소에 임시 업로드합니다. RunPod worker가 HTTPS URL을 내려받아 전사하며, 성공·실패 여부와 무관하게 ave-client가 업로드 파일을 즉시 삭제합니다. `WHISPER_RUNPOD_TIMEOUT_SECONDS`는 앱이 Queue 작업 완료를 기다리는 최대 시간이며 기본값은 3,600초(1시간)입니다. RunPod Endpoint의 worker 실행 제한도 이보다 짧지 않게 설정하세요. SFTP 개인키와 RunPod API 키는 Git에 포함하지 마세요.

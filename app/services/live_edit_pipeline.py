@@ -18,7 +18,9 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from app.config import get_media_root
+from app.services.azure_media_service import AzureMediaError, delete_uploaded_audio, upload_audio_for_transcription
 from app.services.gemini_agents import GeminiAgents
+from app.services.whisper_api_service import WhisperAPIError, transcribe_with_whisper_api
 from app.services.youtube_importer import YouTubeImporter
 
 
@@ -848,6 +850,11 @@ class LiveEditPipeline:
         target_seconds: int = 600,
         chat_delay_seconds: float = 0.0,
         clean_subtitles: bool = False,
+        transcription_source: str = "youtube_caption",
+        stt_language: str = "ko",
+        stt_initial_prompt: str | None = None,
+        stt_hotwords: str | None = None,
+        stt_speed: float = 1.0,
         delay_seconds: float = 0.0,
         subtitle_offset_seconds: float = 0.0,
         subtitle_font_name: str = "Malgun Gothic",
@@ -891,10 +898,34 @@ class LiveEditPipeline:
         subtitle_candidates = [path if path.is_absolute() else (Path.cwd() / path).resolve() for path in subtitle_candidates]
         subtitle = next((path for path in subtitle_candidates if path.suffix.lower() == ".vtt" and ".ko" in path.name), None)
         subtitle = subtitle or next((path for path in subtitle_candidates if path.suffix.lower() == ".vtt"), None)
-        if not subtitle or not subtitle.exists():
+        if transcription_source != "whisper_api" and (not subtitle or not subtitle.exists()):
             raise LiveEditPipelineError("yt-dlp로 한국어 자막을 가져오지 못했습니다. 자동 자막이 없는 영상은 Whisper fallback을 추가해야 합니다.")
 
-        raw_segments = parse_vtt(subtitle)
+        raw_segments = parse_vtt(subtitle) if subtitle else []
+        if transcription_source == "whisper_api":
+            (output_dir / "edit_plan.json").write_text(
+                json.dumps({"source_video_path": str(source.resolve())}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            report(22, "음원을 Azure 전사 저장소에 올리는 중입니다.")
+            try:
+                uploaded_audio = upload_audio_for_transcription(source, job_id)
+                report(25, "Whisper API로 음성을 전사하는 중입니다. 처음 요청은 모델 준비로 오래 걸릴 수 있습니다.")
+                raw_segments = transcribe_with_whisper_api(
+                    uploaded_audio.public_url,
+                    language=stt_language,
+                    initial_prompt=stt_initial_prompt,
+                    hotwords=stt_hotwords,
+                    speed=stt_speed,
+                )["segments"]
+            except (AzureMediaError, WhisperAPIError) as exc:
+                raise LiveEditPipelineError(str(exc)) from exc
+            finally:
+                if "uploaded_audio" in locals():
+                    try:
+                        delete_uploaded_audio(uploaded_audio.remote_name)
+                    except AzureMediaError:
+                        pass
         if not raw_segments:
             raise LiveEditPipelineError("자막 파일은 있지만 시간표시 문장을 읽지 못했습니다.")
 
@@ -969,6 +1000,7 @@ class LiveEditPipeline:
             "vod_url": vod_url,
             "genre": genre,
             "llm_provider": llm_provider,
+            "transcription_source": transcription_source,
             "target_seconds": target_seconds,
             "chat_messages": len(messages),
             "subtitle_count": subtitle_count,
@@ -994,6 +1026,7 @@ class LiveEditPipeline:
             "llm_provider": llm_provider,
             "source_video_path": str(source),
             "subtitle_path": str(subtitle),
+            "transcription_source": transcription_source,
             "raw_transcript_path": str((output_dir / "raw_transcript.json").resolve()),
             "cleaned_transcript_path": str((output_dir / "cleaned_transcript.json").resolve()),
             "summary_path": str((output_dir / "summary.json").resolve()),

@@ -1034,6 +1034,8 @@ button:disabled {
   gap: 6px;
 }
 
+.settings-grid label:has(.range-number-control:empty) { display: none; }
+
 .settings-grid .checkbox-label {
   display: flex;
   align-items: stretch;

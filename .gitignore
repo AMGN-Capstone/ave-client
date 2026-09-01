@@ -4,6 +4,13 @@ media/
 *.pyc
 .env
 *.env
+# Local runtime settings and any backups may contain credentials or internal hosts.
+token.env
+token.env.*
+!token.env.example
+# Never commit private key material.
+*.pem
+*.key
 .venv/
 venv/
 env/

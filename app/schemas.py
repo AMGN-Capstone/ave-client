@@ -80,6 +80,11 @@ class LiveEditRequest(BaseModel):
     chat_delay_seconds: float = Field(default=0.0, ge=-120, le=120)
     clean_subtitles: bool = Field(default=False, description="AI 자막 정제 실행 여부")
     subtitle_offset_seconds: float = Field(default=0.0, ge=-120, le=120)
+    transcription_source: Literal["youtube_caption", "whisper_api"] = "youtube_caption"
+    stt_language: str = Field(default="ko", min_length=1, max_length=20)
+    stt_initial_prompt: str | None = Field(default=None, max_length=1_000)
+    stt_hotwords: str | None = Field(default=None, max_length=1_000)
+    stt_speed: float = Field(default=1.0, ge=1.0, le=4.0)
     subtitle_font_name: str = Field(default="Malgun Gothic", min_length=1, max_length=100)
     subtitle_font_size: int = Field(default=18, ge=8, le=64)
     render_mode: str = Field(default="preview", pattern="^(preview|exact)$")

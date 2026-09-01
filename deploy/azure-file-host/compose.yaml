@@ -1,0 +1,18 @@
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      FILE_HOST_DOMAIN: ${FILE_HOST_DOMAIN:?FILE_HOST_DOMAIN must be set}
+    volumes:
+      - /srv/ave-whisper-media:/srv/ave-whisper-media:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  caddy_data:
+  caddy_config:

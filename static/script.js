@@ -13,6 +13,7 @@ const editProgressMessage = document.querySelector("#editProgressMessage");
 const progressDock = document.querySelector("#progressDock");
 const footerActions = document.querySelector("#footerActions");
 const subtitleOffsetSeconds = document.querySelector("#subtitleOffsetSeconds");
+const transcriptionSource = document.querySelector("#transcriptionSource");
 const analysisPhase = document.querySelector("#analysisPhase");
 const renderPhase = document.querySelector("#renderPhase");
 const backToAnalysisButton = document.querySelector("#backToAnalysisButton");
@@ -100,12 +101,22 @@ function analysisSettingsFingerprint() {
     vod_url: form.get("vod_url"), genre: form.get("genre"), llm_provider: form.get("llm_provider"),
     chat_delay_seconds: form.get("chat_delay_seconds"),
     clean_subtitles: form.get("clean_subtitles") === "on",
+    transcription_source: form.get("transcription_source"), stt_language: form.get("stt_language"),
+    stt_initial_prompt: form.get("stt_initial_prompt"), stt_hotwords: form.get("stt_hotwords"), stt_speed: form.get("stt_speed"),
     target_duration_seconds: form.get("target_duration_seconds"),
     subtitle_offset_seconds: form.get("subtitle_offset_seconds"),
     subtitle_font_name: form.get("subtitle_font_name"),
     subtitle_font_size: form.get("subtitle_font_size"), render_mode: form.get("render_mode"),
   });
 }
+
+function syncSttOptions() {
+  const enabled = transcriptionSource?.value === "whisper_api";
+  document.querySelectorAll(".stt-option").forEach((option) => { option.hidden = !enabled; });
+}
+
+transcriptionSource?.addEventListener("change", syncSttOptions);
+syncSttOptions();
 
 function invalidatePriorAnalysis() {
   if (!analysisFingerprint || analysisSettingsFingerprint() === analysisFingerprint) return;
@@ -688,6 +699,11 @@ async function startAnalysis(event) {
     target_duration_seconds: Number(form.get("target_duration_seconds") || 600),
     chat_delay_seconds: Number(form.get("chat_delay_seconds") || 0),
     clean_subtitles: form.get("clean_subtitles") === "on",
+    transcription_source: form.get("transcription_source") || "youtube_caption",
+    stt_language: form.get("stt_language") || "ko",
+    stt_initial_prompt: form.get("stt_initial_prompt") || null,
+    stt_hotwords: form.get("stt_hotwords") || null,
+    stt_speed: Number(form.get("stt_speed") || 1),
     subtitle_offset_seconds: Number(form.get("subtitle_offset_seconds") || 0),
     subtitle_font_name: form.get("subtitle_font_name") || "Malgun Gothic",
     subtitle_font_size: Number(form.get("subtitle_font_size") || 18),
