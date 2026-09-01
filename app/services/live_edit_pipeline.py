@@ -843,6 +843,7 @@ class LiveEditPipeline:
         vod_url: str,
         archive_path: Path,
         genre: str = "ai_news",
+        llm_provider: str = "gemini",
         actual_start_time: str | None = None,
         target_seconds: int = 600,
         chat_delay_seconds: float = 0.0,
@@ -899,14 +900,15 @@ class LiveEditPipeline:
 
         raw_segments = [{**segment, "id": index} for index, segment in enumerate(raw_segments)]
         report(22, f"자막 {len(raw_segments):,}개 구간을 확인했습니다.")
-        agents = GeminiAgents()
+        agents = GeminiAgents(provider=llm_provider)
+        provider_label = {"gemini": "Gemini", "deepseek": "DeepSeek"}.get(llm_provider, llm_provider)
         cleaned_result = (
             agents.clean_transcript(raw_segments)
             if clean_subtitles
             else {"segments": raw_segments, "removed_count": 0, "skipped": True}
         )
         cleaned_segments = cleaned_result["segments"]
-        report(40, "Gemini 자막 정제를 생략했습니다." if not clean_subtitles else "Gemini가 자막 오타와 중복을 정리했습니다.")
+        report(40, f"{provider_label} 자막 정제를 생략했습니다." if not clean_subtitles else f"{provider_label}가 자막 오타와 중복을 정리했습니다.")
         summary = agents.compress_transcript(cleaned_segments)
         # LLMs return stable subtitle IDs, never timestamps. Resolve their
         # boundaries only after validation on the server.
@@ -922,7 +924,7 @@ class LiveEditPipeline:
             if float(last["end"]) >= float(first["start"]):
                 chapter["start"] = float(first["start"])
                 chapter["end"] = float(last["end"])
-        report(55, "Gemini가 줄거리와 주요 내용을 요약했습니다.")
+        report(55, f"{provider_label}가 줄거리와 주요 내용을 요약했습니다.")
         total_chat_delay = delay_seconds + chat_delay_seconds
         messages = _load_replay_messages(archive_path, actual_start_time, total_chat_delay)
         clusters = _cluster_transcript(cleaned_segments)
@@ -932,7 +934,7 @@ class LiveEditPipeline:
         # Do not pre-filter by chat density or caption length: every script
         # cluster receives the same semantic LLM review.
         scored = agents.score_clusters(clusters, summary, genre=genre)
-        report(80, f"AI가 전체 스크립트 구간 {len(scored):,}개를 평가했습니다.")
+        report(80, f"{provider_label}가 전체 스크립트 구간 {len(scored):,}개를 평가했습니다.")
         for item in scored:
             item["final_score"] = round(float(item.get("llm_score", 0.0)), 3)
         # Stable IDs let the browser send a compact, auditable selection back
@@ -966,6 +968,7 @@ class LiveEditPipeline:
         plan = {
             "vod_url": vod_url,
             "genre": genre,
+            "llm_provider": llm_provider,
             "target_seconds": target_seconds,
             "chat_messages": len(messages),
             "subtitle_count": subtitle_count,
@@ -988,6 +991,7 @@ class LiveEditPipeline:
             "job_id": job_id,
             "vod_video_id": imported.get("job_id"),
             "genre": genre,
+            "llm_provider": llm_provider,
             "source_video_path": str(source),
             "subtitle_path": str(subtitle),
             "raw_transcript_path": str((output_dir / "raw_transcript.json").resolve()),

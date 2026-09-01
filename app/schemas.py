@@ -74,6 +74,7 @@ class LiveFinalizeResponse(BaseModel):
 
 class LiveEditRequest(BaseModel):
     vod_url: str = Field(..., min_length=1, description="이미 업로드된 YouTube 영상 URL")
+    llm_provider: Literal["gemini", "deepseek"] = "gemini"
     genre: Literal["ai_news", "stock", "game"] = "ai_news"
     target_duration_seconds: int = Field(default=600, ge=60, le=3600)
     chat_delay_seconds: float = Field(default=0.0, ge=-120, le=120)

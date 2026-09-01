@@ -97,7 +97,7 @@ themeToggleButton?.addEventListener("click", () => {
 function analysisSettingsFingerprint() {
   const form = new FormData(editForm);
   return JSON.stringify({
-    vod_url: form.get("vod_url"), genre: form.get("genre"),
+    vod_url: form.get("vod_url"), genre: form.get("genre"), llm_provider: form.get("llm_provider"),
     chat_delay_seconds: form.get("chat_delay_seconds"),
     clean_subtitles: form.get("clean_subtitles") === "on",
     target_duration_seconds: form.get("target_duration_seconds"),
@@ -683,6 +683,7 @@ async function startAnalysis(event) {
   const form = new FormData(editForm);
   const requestPayload = {
     vod_url: form.get("vod_url"),
+    llm_provider: form.get("llm_provider") || "gemini",
     genre: form.get("genre") || "ai_news",
     target_duration_seconds: Number(form.get("target_duration_seconds") || 600),
     chat_delay_seconds: Number(form.get("chat_delay_seconds") || 0),

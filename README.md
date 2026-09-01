@@ -167,14 +167,7 @@ SUPABASE_SERVICE_ROLE_KEY=
 
 `SUPABASE_SERVICE_ROLE_KEY`는 서버에서만 사용하며 브라우저 코드나 GitHub에 올리면 안 됩니다.
 
-자막을 내려받을 수 없는 영상은 기본적으로 로컬 `faster-whisper`를 사용합니다.
-로컬 모델을 실행할 수 없는 환경에서는 `token.env`에 아래처럼 설정해 Groq STT를 사용할 수 있습니다.
-
-```env
-TRANSCRIPTION_PROVIDER=groq
-GROQ_API_KEY=
-GROQ_STT_MODEL=whisper-large-v3-turbo
-```
+자막을 내려받을 수 없는 영상은 로컬 `faster-whisper`를 사용합니다.
 
 ## Supabase 설정
 
@@ -227,10 +220,11 @@ python -m uvicorn app.main:app --reload
 프로젝트 루트에서 다음 명령을 실행합니다.
 
 ```powershell
-cd test_yt_web
-..\.venv\Scripts\python.exe -m pip install -r requirements.txt
-..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+.\start.bat
 ```
+
+`start.bat`는 가상환경을 초기화하고 의존성을 설치한 뒤 서버를 실행합니다.
+서버 창에서 Ctrl+C를 누르면 확인 문구 없이 서버가 종료됩니다.
 
 그 다음 브라우저에서 `http://127.0.0.1:8000`을 열고 Google 로그인 → 업로드 완료 영상 URL 입력 → AI 후보 검토 및 렌더링 순서로 진행합니다.
 

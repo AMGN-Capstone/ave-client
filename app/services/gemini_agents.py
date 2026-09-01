@@ -12,6 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import requests
+
+from app.services.llm_gateway import LLMGateway, LLMGatewayError
+
 
 class GeminiAgentError(RuntimeError):
     """Raised when a Gemini agent cannot produce a usable response."""
@@ -183,51 +187,33 @@ def _compact_timed_section_summaries(
 class GeminiAgents:
     """Small JSON-only agents with retries and strict local validation."""
 
-    def __init__(self, *, api_key: str | None = None, model: str | None = None, timeout: float = 120.0):
-        self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        if not self.api_key:
-            raise GeminiAgentError(
-                "GEMINI_API_KEY가 설정되지 않았습니다. test_yt_web/token.env에 추가하세요."
-            )
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    def __init__(self, *, provider: str = "gemini", api_key: str | None = None, model: str | None = None, timeout: float = 120.0):
+        self.provider = provider.lower().strip()
+        try:
+            self.gateway = LLMGateway(self.provider, api_key=api_key, model=model, timeout=timeout)
+        except LLMGatewayError as exc:
+            raise GeminiAgentError(str(exc)) from exc
+        self.api_key = self.gateway.api_key
+        self.model = self.gateway.model
+        self.max_input_chars = self.gateway.max_input_chars
         self.timeout = timeout
         self.cache_dir = Path(os.getenv("GEMINI_CACHE_DIR", "media/gemini-cache")).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.min_request_interval = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "2.0"))
         self._last_request_at = 0.0
-        self.url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:generateContent"
-        )
 
     def _request_json(
         self,
         system: str,
         prompt: str,
         *,
-        retries: int = 3,
+        retries: int = 6,
         response_schema: dict[str, Any] | None = None,
-        allow_model_fallback: bool = True,
     ) -> Any:
-        try:
-            import requests
-        except ImportError as exc:
-            raise GeminiAgentError("requests가 설치되지 않았습니다.") from exc
-
-        payload = {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.15,
-                "maxOutputTokens": 8192,
-                "responseMimeType": "application/json",
-            },
-        }
-        if response_schema:
-            payload["generationConfig"]["responseSchema"] = response_schema
         cache_key = hashlib.sha256(
             json.dumps(
                 {
+                    "provider": self.provider,
                     "model": self.model,
                     "system": system,
                     "prompt": prompt,
@@ -244,34 +230,14 @@ class GeminiAgents:
             except (OSError, json.JSONDecodeError):
                 cache_path.unlink(missing_ok=True)
         last_error: Exception | None = None
-        last_status: int | None = None
         request_prompt = prompt
         for attempt in range(retries):
             try:
-                payload["contents"] = [{"role": "user", "parts": [{"text": request_prompt}]}]
                 elapsed = time.monotonic() - self._last_request_at
                 if elapsed < self.min_request_interval:
                     time.sleep(self.min_request_interval - elapsed)
                 self._last_request_at = time.monotonic()
-                response = requests.post(
-                    self.url,
-                    headers={
-                        "x-goog-api-key": self.api_key,
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                last_status = response.status_code
-                if response.status_code == 429 and attempt < retries - 1:
-                    time.sleep(self._retry_delay(response, attempt))
-                    continue
-                if response.status_code >= 500 and attempt < retries - 1:
-                    time.sleep(self._retry_delay(response, attempt))
-                    continue
-                response.raise_for_status()
-                body = response.json()
-                raw = body["candidates"][0]["content"]["parts"][0]["text"]
+                raw = self.gateway.request_json(system, request_prompt, response_schema=response_schema)
                 try:
                     parsed = _parse_json(raw)
                     cache_path.write_text(
@@ -291,41 +257,15 @@ class GeminiAgents:
                         time.sleep(1.0)
                         continue
                     raise
-            except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+            except requests.RequestException as exc:
                 last_error = exc
-                if attempt == retries - 1 and last_status == 429 and allow_model_fallback:
-                    fallback_result = self._retry_with_fallback_model(
-                        system,
-                        prompt,
-                        response_schema,
-                    )
-                    if fallback_result is not None:
-                        return fallback_result
+                if attempt < retries - 1:
+                    time.sleep(self._retry_delay(getattr(exc, "response", None), attempt))
+            except Exception as exc:
+                last_error = exc
                 if attempt < retries - 1:
                     time.sleep(2.0 ** attempt)
-        raise GeminiAgentError(f"Gemini JSON 응답을 받지 못했습니다: {last_error}") from last_error
-
-    def _retry_with_fallback_model(
-        self,
-        system: str,
-        prompt: str,
-        response_schema: dict[str, Any] | None,
-    ) -> Any:
-        fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
-        if not fallback_model or fallback_model == self.model:
-            return None
-        self.model = fallback_model
-        self.url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:generateContent"
-        )
-        return self._request_json(
-            system,
-            prompt,
-            retries=2,
-            response_schema=response_schema,
-            allow_model_fallback=False,
-        )
+        raise GeminiAgentError(f"{self.provider} JSON 응답을 받지 못했습니다: {last_error}") from last_error
 
     def _retry_delay(self, response: Any, attempt: int) -> float:
         """Use server-provided retry timing, then exponential backoff+jitter."""
@@ -438,7 +378,7 @@ class GeminiAgents:
                 "end": float(item["end"]),
                 "text": text,
             }
-            if chunk and (len(chunk) >= 40 or chars + len(text) > 12000):
+            if chunk and (len(chunk) >= 40 or chars + len(text) > min(12_000, self.max_input_chars)):
                 flush()
             chunk.append(candidate)
             chars += len(text)
@@ -515,7 +455,7 @@ class GeminiAgents:
         chars = 0
         for index, item in enumerate(sorted(segments, key=lambda value: float(value.get("start", 0.0)))):
             line = {"id": int(item.get("id", index)), "text": str(item["text"])}
-            if current and chars + len(line["text"]) > 14000:
+            if current and chars + len(line["text"]) > min(14_000, self.max_input_chars):
                 chunks.append(
                     {
                         "section_id": len(chunks),
@@ -634,17 +574,47 @@ JSON {\"summary\":string,\"key_points\":[string],\"chapters\":[{\"title\":string
                 }
                 for left, right in zip(section_summaries, section_summaries[1:])
             ]
-            reviewed = self._request_json(
-                """당신은 긴 영상 자막의 청크 경계 검토 에이전트입니다.
+            def review_boundary_batch(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                reviewed = self._request_json(
+                    """당신은 긴 영상 자막의 청크 경계 검토 에이전트입니다.
 인접한 두 요약이 하나의 논리 흐름 또는 같은 주제를 잘린 것인지 판단하세요. 같은 흐름이면 merge=true,
 명확한 주제 전환이면 false로 하세요. JSON {\"boundaries\":[{\"left_section_id\":number,\"right_section_id\":number,\"merge\":boolean}]}만 반환하세요.""",
-                json.dumps(boundary_payload, ensure_ascii=False),
-                response_schema={"type": "OBJECT", "properties": {"boundaries": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"left_section_id": {"type": "INTEGER"}, "right_section_id": {"type": "INTEGER"}, "merge": {"type": "BOOLEAN"}}, "required": ["left_section_id", "right_section_id", "merge"]}}}, "required": ["boundaries"]},
-            )
-            if isinstance(reviewed, dict) and isinstance(reviewed.get("boundaries"), list):
-                boundary_reviews = [item for item in reviewed["boundaries"] if isinstance(item, dict)]
+                    json.dumps(items, ensure_ascii=False),
+                    response_schema={"type": "OBJECT", "properties": {"boundaries": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"left_section_id": {"type": "INTEGER"}, "right_section_id": {"type": "INTEGER"}, "merge": {"type": "BOOLEAN"}}, "required": ["left_section_id", "right_section_id", "merge"]}}}, "required": ["boundaries"]},
+                )
+                if not isinstance(reviewed, dict) or not isinstance(reviewed.get("boundaries"), list):
+                    return []
+                return [item for item in reviewed["boundaries"] if isinstance(item, dict)]
 
-        compact_input = _compact_timed_section_summaries(section_summaries)
+            batch: list[dict[str, Any]] = []
+            batch_chars = 0
+            for item in boundary_payload:
+                item_chars = len(json.dumps(item, ensure_ascii=False))
+                if batch and batch_chars + item_chars > self.max_input_chars:
+                    boundary_reviews.extend(review_boundary_batch(batch))
+                    batch, batch_chars = [], 0
+                batch.append(item)
+                batch_chars += item_chars
+            if batch:
+                boundary_reviews.extend(review_boundary_batch(batch))
+
+        compact_input = _compact_timed_section_summaries(
+            section_summaries,
+            max_chars=self.max_input_chars,
+        )
+        # Boundary decisions are useful hints, but a very long video can have
+        # thousands of them. Keep the final synthesis request within the same
+        # provider transport budget.
+        boundary_json = json.dumps(boundary_reviews, ensure_ascii=False)
+        boundary_budget = max(0, self.max_input_chars - len(compact_input) - 1_000)
+        if len(boundary_json) > boundary_budget:
+            compact_boundaries = []
+            for item in boundary_reviews:
+                candidate = json.dumps(item, ensure_ascii=False)
+                if len(json.dumps(compact_boundaries, ensure_ascii=False)) + len(candidate) > boundary_budget:
+                    break
+                compact_boundaries.append(item)
+            boundary_json = json.dumps(compact_boundaries, ensure_ascii=False)
         final = self._request_json(
             """당신은 영상 편집용 최종 요약 에이전트입니다.
 전체 흐름을 짧고 자연스럽게 설명하고, 시청자가 반드시 알아야 할 핵심 내용을 우선하세요.
@@ -655,7 +625,7 @@ JSON {\"summary\":string,\"key_points\":[string],\"chapters\":[{\"title\":string
             "다음은 ID 범위와 주제 경계가 포함된 자막 중간 요약입니다. 중복 주제를 합치고 최종 요약을 작성하세요.\n"
             + compact_input
             + "\n청크 경계 검토 결과:\n"
-            + json.dumps(boundary_reviews, ensure_ascii=False),
+            + boundary_json,
             response_schema={
                 "type": "OBJECT",
                 "properties": {
@@ -694,8 +664,18 @@ JSON {\"summary\":string,\"key_points\":[string],\"chapters\":[{\"title\":string
     ) -> list[dict[str, Any]]:
         """Rank every transcript cluster from the same compact item contract."""
         scored: list[dict[str, Any]] = []
-        for offset in range(0, len(clusters), batch_size):
-            batch = clusters[offset : offset + batch_size]
+        offset = 0
+        while offset < len(clusters):
+            batch = []
+            chars = 0
+            for cluster in clusters[offset : offset + batch_size]:
+                text = str(cluster.get("text", ""))
+                if batch and chars + len(text) > self.max_input_chars:
+                    break
+                batch.append(cluster)
+                chars += len(text)
+            if not batch:
+                batch = [clusters[offset]]
             payload = [
                 {"id": offset + index, "text": item["text"]}
                 for index, item in enumerate(batch)
@@ -736,4 +716,5 @@ JSON {\"summary\":string,\"key_points\":[string],\"chapters\":[{\"title\":string
                     continue
             for index, item in enumerate(batch):
                 scored.append({**item, **by_id.get(offset + index, {"llm_score": 0.0, "reason": "LLM 평가 누락"})})
+            offset += len(batch)
         return scored

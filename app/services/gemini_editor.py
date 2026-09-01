@@ -48,7 +48,7 @@ class GeminiEditor:
                 "GEMINI_API_KEY is not configured. Add it to test_yt_web/token.env."
             )
 
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         self.timeout = timeout
         self.url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"

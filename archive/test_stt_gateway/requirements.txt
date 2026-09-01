@@ -1,8 +1,0 @@
-audioop-lts==0.2.2
-certifi==2026.6.17
-charset-normalizer==3.4.9
-idna==3.18
-pydub==0.25.1
-python-dotenv==1.2.2
-requests==2.34.2
-urllib3==2.7.0

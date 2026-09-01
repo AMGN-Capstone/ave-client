@@ -37,6 +37,15 @@
           <input id="editVodUrl" name="vod_url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" required>
           <div class="settings-grid">
             <label>
+              <span class="setting-title">LLM 엔진</span>
+              <span class="setting-content"><select id="llmProvider" name="llm_provider">
+                <option value="gemini">Gemini</option>
+                <option value="deepseek">DeepSeek</option>
+              </select>
+              <small>선택한 엔진의 API 키가 token.env에 설정되어 있어야 합니다.</small>
+              </span>
+            </label>
+            <label>
               <span class="setting-title">영상 장르</span>
               <span class="setting-content"><select id="editGenre" name="genre">
                 <option value="ai_news">AI 뉴스</option>
