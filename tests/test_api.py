@@ -1,5 +1,6 @@
 import json
 from io import BytesIO
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -23,9 +24,9 @@ class FakeYouTubeImporter:
             "source_url": url,
             "title": "Sample information video",
             "duration": 1234,
-            "video_path": "media/youtube/sample-job/video.mp4",
-            "subtitle_files": ["media/youtube/sample-job/subtitles.ko.vtt"],
-            "metadata_path": "media/youtube/sample-job/metadata.json",
+            "video_path": "media/yt-data/sample-video-id/video.mp4",
+            "subtitle_files": ["media/yt-data/sample-video-id/subtitles.ko.vtt"],
+            "metadata_path": "media/yt-data/sample-video-id/sample-video-id.info.json",
             "warnings": [],
         }
 
@@ -99,7 +100,7 @@ def test_upload_video_saves_supported_file(tmp_path, monkeypatch):
     assert body["original_filename"] == "lesson.mp4"
     assert body["stored_filename"].endswith(".mp4")
     assert body["content_type"] == "video/mp4"
-    assert (tmp_path / "uploads" / body["stored_filename"]).exists()
+    assert (tmp_path / "yt-edit" / "uploads" / Path(body["stored_filename"]).stem / body["stored_filename"]).exists()
 
 
 def test_upload_video_rejects_unsupported_extension(tmp_path, monkeypatch):
@@ -148,7 +149,7 @@ def test_completed_video_edit_continues_when_chat_replay_is_unavailable(tmp_path
 def test_segment_review_and_source_preview_endpoints(tmp_path, monkeypatch):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     job_id = "segment-api-job"
-    output_dir = tmp_path / "youtube-live-edit" / job_id
+    output_dir = tmp_path / "yt-edit" / job_id
     output_dir.mkdir(parents=True)
     source = tmp_path / "source.mp4"
     source.write_bytes(b"fake mp4")

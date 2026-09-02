@@ -13,7 +13,7 @@ from app.services.live_edit_pipeline import (
 
 
 def _write_saved_review_job(tmp_path, job_id="review-job"):
-    output_dir = tmp_path / "youtube-live-edit" / job_id
+    output_dir = tmp_path / "yt-edit" / job_id
     output_dir.mkdir(parents=True)
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")

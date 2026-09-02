@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from threading import Lock
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
-from uuid import uuid4
 
 from app.config import get_media_root
 
 
 YOUTUBE_API_ROOT = "https://www.googleapis.com/youtube/v3"
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+THUMBNAIL_FILENAMES = {"sddefault.jpg", "sd1.jpg", "sd2.jpg", "sd3.jpg"}
 
 
 class LiveYouTubeError(RuntimeError):
@@ -26,13 +25,83 @@ _CHAT_ARCHIVE_LOCK = Lock()
 
 
 def _chat_archive_path(live_chat_id: str) -> Path:
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id)
-    return get_media_root() / "youtube-live-chat" / f"{safe_id}.jsonl"
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id.removeprefix("vod-"))
+    return get_media_root() / "yt-edit" / safe_id / "chat-replay.jsonl"
 
 
 def _chat_session_path(live_chat_id: str) -> Path:
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id)
-    return get_media_root() / "youtube-live-chat" / f"{safe_id}.session.json"
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id.removeprefix("vod-"))
+    return get_media_root() / "yt-edit" / safe_id / "chat-session.json"
+
+
+def _download_thumbnail_list(
+    downloader,
+    thumbnails: list[dict],
+    main_thumbnail: str | None,
+    output_dir: Path,
+    video_id: str,
+) -> list[dict]:
+    """Save every thumbnail entry reported by yt-dlp, without deduplication."""
+
+    thumbnail_dir = output_dir / "thumbnails"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[dict] = []
+    for index, thumbnail in enumerate(thumbnails, start=1):
+        if not isinstance(thumbnail, dict) or not isinstance(thumbnail.get("url"), str):
+            continue
+        # Store the filename yt-dlp exposes in the thumbnail URL unchanged.
+        filename = Path(urlparse(thumbnail["url"]).path).name
+        if filename not in THUMBNAIL_FILENAMES:
+            continue
+        is_primary = filename == "sddefault.jpg"
+        path = thumbnail_dir / filename
+        try:
+            if not path.exists():
+                response = downloader.urlopen(thumbnail["url"])
+                try:
+                    content = response.read()
+                finally:
+                    response.close()
+                if not content:
+                    continue
+                path.write_bytes(content)
+        except Exception:
+            # An unavailable secondary thumbnail must not make metadata
+            # inspection fail; the original URL remains in info.json.
+            continue
+        saved.append({
+            "id": str(index),
+            "url": f"/api/youtube/thumbnail/{video_id}/{filename}",
+            "source_url": thumbnail["url"],
+            "width": thumbnail.get("width"),
+            "height": thumbnail.get("height"),
+            "is_primary": is_primary,
+        })
+    if saved and not any(item["is_primary"] for item in saved):
+        saved[0]["is_primary"] = True
+    return saved
+
+
+def _cached_thumbnail_files(output_dir: Path, video_id: str, main_thumbnail: str | None) -> list[dict]:
+    """Expose previously saved thumbnail assets without contacting YouTube."""
+
+    thumbnail_dir = output_dir / "thumbnails"
+    if not thumbnail_dir.exists():
+        return []
+    files: list[dict] = []
+    for path in sorted(thumbnail_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if path.name not in THUMBNAIL_FILENAMES:
+            continue
+        files.append({
+            "id": path.stem,
+            "url": f"/api/youtube/thumbnail/{video_id}/{path.name}",
+            "is_primary": path.name == "sddefault.jpg",
+        })
+    if files and not any(item["is_primary"] for item in files):
+        files[0]["is_primary"] = True
+    return files
 
 
 def _save_chat_messages(live_chat_id: str, messages: list[dict]) -> Path:
@@ -76,26 +145,8 @@ def _save_chat_messages(live_chat_id: str, messages: list[dict]) -> Path:
     return archive_path
 
 
-def _parse_elapsed_time(value: str | None) -> float | None:
-    """Convert pytchat's replay-only HH:MM:SS elapsed time to seconds."""
-
-    if not value:
-        return None
-    try:
-        parts = [int(part) for part in str(value).split(":")]
-    except ValueError:
-        return None
-    if len(parts) == 2:
-        minutes, seconds = parts
-        return float(minutes * 60 + seconds)
-    if len(parts) == 3:
-        hours, minutes, seconds = parts
-        return float(hours * 3600 + minutes * 60 + seconds)
-    return None
-
-
 def _save_replay_messages(archive_key: str, messages: list[dict]) -> Path:
-    """Append pytchat replay records to the same normalized JSONL archive."""
+    """Append normalized yt-dlp replay records to the JSONL archive."""
 
     archive_path = _chat_archive_path(archive_key)
     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,68 +175,87 @@ def _save_replay_messages(archive_key: str, messages: list[dict]) -> Path:
     return archive_path
 
 
-def collect_chat_replay(video_id: str, archive_key: str) -> dict:
-    """Collect an archived live-chat replay through pytchat.
+def _chat_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if isinstance(value.get("simpleText"), str):
+            return value["simpleText"]
+        runs = value.get("runs")
+        if isinstance(runs, list):
+            return "".join(str(run.get("text", "")) for run in runs if isinstance(run, dict))
+    return ""
 
-    pytchat exposes ``elapsedTime`` for replay messages, which is preferable
-    to calculating an offset from wall-clock timestamps because it already
-    follows the VOD playback timeline.
-    """
 
+def _normalize_ytdlp_replay_action(action: dict) -> list[dict]:
+    replay = action.get("replayChatItemAction") if isinstance(action, dict) else None
+    if not isinstance(replay, dict):
+        return []
     try:
-        import pytchat
-    except ImportError as exc:
-        raise LiveYouTubeError(
-            "pytchat이 설치되어 있지 않습니다. requirements.txt를 설치하세요."
-        ) from exc
-
+        elapsed_seconds = float(replay.get("videoOffsetTimeMsec")) / 1000
+    except (TypeError, ValueError):
+        return []
     messages: list[dict] = []
-    chat = None
-    try:
-        # pytchat registers SIGINT by default. The collector runs in a worker
-        # thread during the FastAPI request, so disable that signal hook and
-        # let the request's finally block terminate the client instead.
-        chat = pytchat.create(
-            video_id=video_id,
-            force_replay=True,
-            interruptable=False,
+    for nested in replay.get("actions", []):
+        item = nested.get("addChatItemAction", {}).get("item", {}) if isinstance(nested, dict) else {}
+        if not isinstance(item, dict):
+            continue
+        renderer_name, renderer = next(
+            ((name, value) for name, value in item.items() if name.endswith("Renderer") and isinstance(value, dict)),
+            (None, None),
         )
-        while chat.is_alive():
-            data = chat.get()
-            for item in getattr(data, "items", []):
-                elapsed_seconds = _parse_elapsed_time(
-                    getattr(item, "elapsedTime", None)
-                )
-                if elapsed_seconds is None:
-                    continue
-                messages.append(
-                    {
-                        "id": getattr(item, "id", None),
-                        "time": getattr(item, "datetime", None),
-                        "elapsed_seconds": elapsed_seconds,
-                        "message": getattr(item, "message", ""),
-                        "type": getattr(item, "type", "textMessage"),
-                        "super_chat": {
-                            "amount": getattr(item, "amountString", ""),
-                            "currency": getattr(item, "currency", ""),
-                        }
-                        if getattr(item, "amountString", "")
-                        else None,
-                    }
-                )
-            time.sleep(0.1)
-    except Exception as exc:
-        raise LiveYouTubeError(f"pytchat 다시보기 수집에 실패했습니다: {exc}") from exc
-    finally:
-        if chat is not None:
-            try:
-                chat.terminate()
-            except Exception:
-                pass
+        if renderer is None:
+            continue
+        message = _chat_text(renderer.get("message")) or _chat_text(renderer.get("headerSubtext"))
+        messages.append({
+            "id": renderer.get("id"),
+            "elapsed_seconds": elapsed_seconds,
+            "message": message,
+            "type": renderer_name,
+            "super_chat": _chat_text(renderer.get("purchaseAmountText")) or None,
+        })
+    return messages
 
+
+def collect_chat_replay(video_id: str, archive_key: str) -> dict:
+    """Download and normalize an archived live-chat replay with yt-dlp."""
+
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
+
+    output_dir = get_media_root() / "yt-data" / video_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    options = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "subtitleslangs": ["live_chat"],
+        "subtitlesformat": "json",
+        "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+    }
+    try:
+        with YoutubeDL(options) as downloader:
+            downloader.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+    except Exception as exc:
+        raise LiveYouTubeError(f"yt-dlp 채팅 리플레이 수집에 실패했습니다: {exc}") from exc
+
+    raw_files = sorted(output_dir.glob("*.live_chat.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not raw_files:
+        raise LiveYouTubeError("yt-dlp가 채팅 리플레이 파일을 제공하지 않았습니다.")
+    messages: list[dict] = []
+    for line in raw_files[0].read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            messages.extend(_normalize_ytdlp_replay_action(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    if not messages:
+        raise LiveYouTubeError("yt-dlp 채팅 리플레이에서 시간 정보가 있는 메시지를 읽지 못했습니다.")
     archive_path = _save_replay_messages(archive_key, messages)
     return {
-        "source": "pytchat_replay",
+        "source": "yt_dlp_live_chat_replay",
         "video_id": video_id,
         "archive_key": archive_key,
         "message_count": len(messages),
@@ -531,24 +601,124 @@ def get_live_chat(
     }
 
 
-def get_video_metadata(access_token: str, video_id: str) -> dict:
-    body = _youtube_get(
-        "videos",
-        access_token,
-        {"part": "snippet,contentDetails,liveStreamingDetails", "id": video_id},
-    )
-    items = body.get("items", [])
-    if not items:
-        raise LiveYouTubeError("다시보기 영상을 찾지 못했습니다.")
-    item = items[0]
-    duration_iso = item.get("contentDetails", {}).get("duration")
-    return {
-        "video_id": item.get("id", video_id),
-        "title": item.get("snippet", {}).get("title"),
-        "duration_iso": duration_iso,
-        "duration_seconds": parse_iso_duration_seconds(duration_iso),
-        "live_details": item.get("liveStreamingDetails", {}),
+def get_video_metadata(url: str) -> dict:
+    """Read and persist phase-one public metadata through yt-dlp."""
+
+    thumbnail_files: list[dict] = []
+    video_id = extract_video_id(url)
+    output_dir = get_media_root() / "yt-data" / video_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    info_path = output_dir / f"{video_id}.info.json"
+    info: dict | None = None
+    if info_path.exists():
+        try:
+            cached_info = json.loads(info_path.read_text(encoding="utf-8"))
+            if isinstance(cached_info, dict):
+                info = cached_info
+                thumbnail_files = _cached_thumbnail_files(output_dir, video_id, info.get("thumbnail"))
+                # Older caches predate the thumbnails directory. Reuse their
+                # info JSON and only backfill missing image assets; metadata
+                # extraction itself is not repeated.
+                if not thumbnail_files and info.get("thumbnails"):
+                    try:
+                        from yt_dlp import YoutubeDL
+                        with YoutubeDL({"quiet": True, "no_warnings": True}) as downloader:
+                            thumbnail_files = _download_thumbnail_list(
+                                downloader,
+                                info["thumbnails"],
+                                info.get("thumbnail"),
+                                output_dir,
+                                str(info.get("id") or video_id),
+                            )
+                    except Exception:
+                        pass
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if info is None:
+        try:
+            from yt_dlp import YoutubeDL
+        except ImportError as exc:
+            raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
+        try:
+            with YoutubeDL({
+                "skip_download": True,
+                "writeinfojson": True,
+                "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+            }) as downloader:
+                # download=True persists the unmodified yt-dlp info JSON.
+                info = downloader.extract_info(url, download=True)
+                if isinstance(info, dict):
+                    thumbnail_files = _download_thumbnail_list(
+                        downloader,
+                        info.get("thumbnails") or [],
+                        info.get("thumbnail"),
+                        output_dir,
+                        str(info.get("id") or video_id),
+                    )
+        except Exception as exc:
+            raise LiveYouTubeError(f"YouTube 메타데이터를 가져오지 못했습니다: {exc}") from exc
+
+    if not isinstance(info, dict):
+        raise LiveYouTubeError("YouTube 메타데이터 형식이 올바르지 않습니다.")
+
+    subtitles = info.get("subtitles") or {}
+    automatic_captions = info.get("automatic_captions") or {}
+    # yt-dlp places a `live_chat` pseudo-subtitle in `subtitles`. It is a
+    # chat stream, not a user-uploaded subtitle track.
+    uploaded_subtitles = {
+        language: tracks
+        for language, tracks in subtitles.items()
+        if language != "live_chat"
     }
+    live_chat_tracks = subtitles.get("live_chat") or []
+    live_status = str(info.get("live_status") or "")
+    chat_replay = info.get("chat_replay")
+    if not isinstance(chat_replay, bool):
+        chat_replay = any(
+            isinstance(track, dict)
+            and track.get("protocol") == "youtube_live_chat_replay"
+            for track in live_chat_tracks
+        )
+        if not chat_replay:
+            # The YouTube extractor does not consistently expose a separate
+            # `chat_replay` key. A completed livestream is the yt-dlp signal
+            # that a replay chat can be requested; the editing job still
+            # verifies it before using the messages.
+            chat_replay = live_status in {"was_live", "post_live"}
+    metadata = {
+        "source_url": url,
+        "thumbnail": next(
+            (item["url"] for item in thumbnail_files if item.get("is_primary")),
+            info.get("thumbnail"),
+        ),
+        "thumbnails": info.get("thumbnails") or [],
+        "thumbnail_files": thumbnail_files,
+        "title": info.get("title"),
+        "video_id": info.get("id"),
+        "description": info.get("description"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "upload_date": info.get("upload_date"),
+        "duration_seconds": info.get("duration"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
+        "categories": info.get("categories") or [],
+        "tags": info.get("tags") or [],
+        "subtitles_available": bool(uploaded_subtitles),
+        "captions_available": bool(automatic_captions),
+        "chapters": info.get("chapters") or [],
+        "heatmap": info.get("heatmap") or [],
+        "chat_replay_available": chat_replay,
+        "live_status": live_status or None,
+        # Compatibility fields used by the legacy live-finalization response.
+        "duration_iso": info.get("duration_string"),
+        "live_details": {"live_status": live_status} if live_status else {},
+    }
+    info_path = output_dir / f"{video_id}.info.json"
+    return {**metadata, "metadata_path": str(info_path.resolve())}
 
 
 def download_live_captions(url: str) -> dict:
@@ -559,7 +729,8 @@ def download_live_captions(url: str) -> dict:
     except ImportError as exc:
         raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
 
-    job_dir = get_media_root() / "youtube-live" / uuid4().hex
+    video_id = extract_video_id(url)
+    job_dir = get_media_root() / "yt-data" / video_id
     job_dir.mkdir(parents=True, exist_ok=True)
     options = {
         "skip_download": True,
@@ -569,7 +740,7 @@ def download_live_captions(url: str) -> dict:
         # rest of the live-metadata response when YouTube rate-limits them.
         "subtitleslangs": ["ko"],
         "subtitlesformat": "vtt",
-        "outtmpl": str(job_dir / "%(title).120s-%(id)s.%(ext)s"),
+        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
     }
@@ -637,14 +808,14 @@ def _transcribe_downloaded_audio(url: str, job_dir: Path) -> dict:
     audio_dir.mkdir(parents=True, exist_ok=True)
     options = {
         "format": "bestaudio/best",
-        "outtmpl": str(audio_dir / "source.%(ext)s"),
+        "outtmpl": str(audio_dir / "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
     }
     with YoutubeDL(options) as downloader:
         info = downloader.extract_info(url, download=True)
 
-    audio_files = [path for path in audio_dir.glob("source.*") if path.is_file()]
+    audio_files = [path for path in audio_dir.glob(f"{extract_video_id(url)}.*") if path.is_file()]
     if not audio_files:
         raise LiveYouTubeError("오디오 파일을 찾지 못했습니다.")
 

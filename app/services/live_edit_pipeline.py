@@ -184,7 +184,7 @@ def _load_replay_messages(archive_path: Path, actual_start_time: str | None, del
             elapsed = float(elapsed)
         except (TypeError, ValueError):
             continue
-        # pytchat replay records already provide elapsed_seconds, whereas old
+        # Normalized replay records provide elapsed_seconds, whereas old
         # archives use absolute publish time. Apply the same user correction
         # to either representation.
         elapsed -= delay_seconds
@@ -877,7 +877,7 @@ class LiveEditPipeline:
         job_id = job_id or uuid4().hex
         if Path(job_id).name != job_id:
             raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
-        output_dir = self.media_root / "youtube-live-edit" / job_id
+        output_dir = self.media_root / "yt-edit" / job_id
         output_dir.mkdir(parents=True, exist_ok=True)
         report(5, "기존 원본 영상과 자막을 확인하는 중입니다.")
         importer = YouTubeImporter(self.media_root)
@@ -1337,7 +1337,7 @@ class LiveEditPipeline:
     def _load_edit_plan(self, job_id: str) -> tuple[Path, dict[str, Any]]:
         if not job_id or Path(job_id).name != job_id:
             raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
-        output_dir = self.media_root / "youtube-live-edit" / job_id
+        output_dir = self.media_root / "yt-edit" / job_id
         plan_path = output_dir / "edit_plan.json"
         if not plan_path.exists():
             raise LiveEditPipelineError("편집 계획 파일을 찾을 수 없습니다.")
@@ -1352,7 +1352,7 @@ class LiveEditPipeline:
     def rerender_from_saved_subtitles(self, job_id: str) -> dict[str, Any]:
         """Re-render an existing edit after the user changes its SRT file."""
 
-        output_dir = self.media_root / "youtube-live-edit" / job_id
+        output_dir = self.media_root / "yt-edit" / job_id
         plan_path = output_dir / "edit_plan.json"
         subtitles = output_dir / "subtitles.srt"
         if not plan_path.exists() or not subtitles.exists():

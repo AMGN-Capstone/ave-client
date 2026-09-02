@@ -6,13 +6,13 @@ from app.services.youtube_importer import YouTubeImporter
 
 
 def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, monkeypatch):
-    cache_dir = tmp_path / "youtube" / "cache-abc123"
+    cache_dir = tmp_path / "yt-data" / "abc123"
     cache_dir.mkdir(parents=True)
     video = cache_dir / "sample-abc123.mp4"
     subtitle = cache_dir / "sample-abc123.ko.vtt"
     video.write_bytes(b"existing video")
     subtitle.write_text("WEBVTT\n", encoding="utf-8")
-    (cache_dir / "metadata.json").write_text(
+    (cache_dir / "abc123.info.json").write_text(
         json.dumps(
             {
                 "source_url": "https://www.youtube.com/watch?v=abc123",
@@ -89,7 +89,8 @@ def test_import_retries_without_subtitles_when_youtube_rate_limits_subtitles(
         "The video was imported without subtitles."
     ]
 
-    metadata = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+    import_record = tmp_path / "yt-edit" / result["job_id"] / "import.json"
+    metadata = json.loads(import_record.read_text(encoding="utf-8"))
     assert metadata["warnings"] == result["warnings"]
 
 
@@ -134,8 +135,33 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
         "quality may be lower."
     ]
 
-    metadata = json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))
+    import_record = tmp_path / "yt-edit" / result["job_id"] / "import.json"
+    metadata = json.loads(import_record.read_text(encoding="utf-8"))
     assert metadata["warnings"] == result["warnings"]
+
+
+def test_import_record_does_not_modify_ytdlp_info_json(tmp_path):
+    importer = YouTubeImporter(tmp_path)
+    source_dir = tmp_path / "yt-data" / "abc123"
+    source_dir.mkdir(parents=True)
+    info_path = source_dir / "abc123.info.json"
+    source_info = {"id": "abc123", "title": "yt-dlp source"}
+    info_path.write_text(json.dumps(source_info), encoding="utf-8")
+
+    returned_path = importer._write_metadata(
+        source_dir,
+        "edit-job",
+        "https://www.youtube.com/watch?v=abc123",
+        source_info,
+        None,
+        [],
+        ["import warning"],
+    )
+
+    assert returned_path == info_path
+    assert json.loads(info_path.read_text(encoding="utf-8")) == source_info
+    import_record = json.loads((tmp_path / "yt-edit" / "edit-job" / "import.json").read_text(encoding="utf-8"))
+    assert import_record["warnings"] == ["import warning"]
 
 
 class ForbiddenThenFallbackYoutubeDL(SingleFileYoutubeDL):

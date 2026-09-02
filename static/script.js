@@ -3,18 +3,41 @@ const googleLoginButton = document.querySelector("#googleLoginButton");
 const logoutButton = document.querySelector("#logoutButton");
 const themeToggleButton = document.querySelector("#themeToggleButton");
 const editForm = document.querySelector("#editForm");
+const workspace = document.querySelector(".workspace");
+const metadataForm = document.querySelector("#metadataForm");
+const editVodUrl = document.querySelector("#editVodUrl");
+const analysisVodUrl = document.querySelector("#analysisVodUrl");
+const fetchMetadataButton = document.querySelector("#fetchMetadataButton");
+const continueToAnalysisButton = document.querySelector("#continueToAnalysisButton");
+const metadataMessage = document.querySelector("#metadataMessage");
+const videoMetadataCard = document.querySelector("#videoMetadataCard");
+const metadataCardBody = videoMetadataCard?.querySelector(".video-metadata-card");
+const metadataThumbnail = document.querySelector("#metadataThumbnail");
+const metadataThumbnailLink = document.querySelector("#metadataThumbnailLink");
+const metadataThumbnailList = document.querySelector("#metadataThumbnailList");
+const metadataVideoTitle = document.querySelector("#metadataVideoTitle");
+const metadataList = document.querySelector("#metadataList");
+const metadataDescription = document.querySelector("#metadataDescription");
+const metadataChapters = document.querySelector("#metadataChapters");
+const metadataHeatmapChart = document.querySelector("#metadataHeatmapChart");
+const metadataHeatmap = document.querySelector("#metadataHeatmap");
+const metadataPages = [...document.querySelectorAll("[data-metadata-page]")];
+const metadataPageButtons = [...document.querySelectorAll("[data-metadata-page-button]")];
 const startAnalysisButton = document.querySelector("#startAnalysisButton");
+const backToMetadataButton = document.querySelector("#backToMetadataButton");
 const editResult = null;
 const editProgress = document.querySelector("#editProgress");
 const editProgressLabel = document.querySelector("#editProgressLabel");
 const editProgressPercent = document.querySelector("#editProgressPercent");
 const editProgressBar = document.querySelector("#editProgressBar");
 const editProgressMessage = document.querySelector("#editProgressMessage");
+const editProgressElapsed = document.querySelector("#editProgressElapsed");
 const progressDock = document.querySelector("#progressDock");
 const footerActions = document.querySelector("#footerActions");
 const subtitleOffsetSeconds = document.querySelector("#subtitleOffsetSeconds");
 const transcriptionSource = document.querySelector("#transcriptionSource");
 const analysisPhase = document.querySelector("#analysisPhase");
+const metadataPhase = document.querySelector("#metadataPhase");
 const renderPhase = document.querySelector("#renderPhase");
 const backToAnalysisButton = document.querySelector("#backToAnalysisButton");
 const backToReviewButton = document.querySelector("#backToReviewButton");
@@ -52,7 +75,16 @@ let editPollGeneration = 0;
 let analysisFingerprint = null;
 let isEditJobRunning = false;
 let isProgressDocked = false;
+let confirmedMetadataUrl = null;
+let hasOpenedMetadataCard = false;
+let hasStartedMetadataTransition = false;
+let metadataTransitionEndsAt = 0;
+let metadataProgressTimer = null;
+let progressElapsedStartedAt = null;
+let progressElapsedSeconds = 0;
+let progressElapsedTimer = null;
 const phaseActionGroups = {
+  metadata: metadataPhase?.querySelector(".phase-actions"),
   analysis: analysisPhase?.querySelector(".phase-actions"),
   review: segmentReviewer?.querySelector(".phase-actions"),
   render: renderPhase?.querySelector(".phase-actions"),
@@ -61,15 +93,14 @@ const phaseActionGroups = {
 function showPhase(name, { resetProgress = false } = {}) {
   document.querySelectorAll("video").forEach((video) => video.pause());
   currentPreviewEnd = null;
-  const phases = { analysis: analysisPhase, review: segmentReviewer, render: renderPhase };
+  const phases = { metadata: metadataPhase, analysis: analysisPhase, review: segmentReviewer, render: renderPhase };
   Object.entries(phases).forEach(([phase, element]) => {
     if (element) element.hidden = phase !== name;
   });
   const actions = phaseActionGroups[name];
   if (footerActions && actions) footerActions.replaceChildren(actions);
   if (resetProgress) {
-    renderEditProgress({ progress: 0, status: "idle", phase: name, message: "작업을 준비하는 중입니다." });
-    if (editProgressLabel) editProgressLabel.textContent = "AI 편집 진행률";
+    resetEditProgress(name);
   }
   window.scrollTo({ top: 0, behavior: "smooth" });
   requestAnimationFrame(updateProgressDock);
@@ -108,6 +139,24 @@ function analysisSettingsFingerprint() {
     subtitle_font_name: form.get("subtitle_font_name"),
     subtitle_font_size: form.get("subtitle_font_size"), render_mode: form.get("render_mode"),
   });
+}
+
+function beginMetadataTransition() {
+  if (hasStartedMetadataTransition) return;
+  hasStartedMetadataTransition = true;
+  const panelTopBeforeTransition = metadataPhase.getBoundingClientRect().top;
+  workspace?.classList.replace("phase-one-idle", "phase-one-expanded");
+  const panelOffset = panelTopBeforeTransition - metadataPhase.getBoundingClientRect().top;
+  metadataPhase.classList.add("metadata-awaiting-reveal");
+  // Apply the visual start position without a transition first (FLIP).
+  metadataPhase.style.transform = `translateY(${panelOffset}px)`;
+  void metadataPhase.offsetWidth;
+  metadataTransitionEndsAt = Date.now() + 850;
+  metadataPhase.classList.add("metadata-phase-moving");
+  requestAnimationFrame(() => {
+    metadataPhase.style.transform = "";
+  });
+  window.setTimeout(() => metadataPhase.classList.remove("metadata-phase-moving"), 870);
 }
 
 function syncSttOptions() {
@@ -173,6 +222,212 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function formatMetadataNumber(value) {
+  return Number.isFinite(Number(value)) ? new Intl.NumberFormat("ko-KR").format(Number(value)) : "정보 없음";
+}
+
+function formatMetadataDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "정보 없음";
+  return formatSeconds(seconds);
+}
+
+function formatUploadDate(value) {
+  const text = String(value || "");
+  if (!/^\d{8}$/.test(text)) return text || "정보 없음";
+  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
+}
+
+function metadataValue(value, fallback = "정보 없음") {
+  if (value === null || value === undefined || value === "") return fallback;
+  return String(value);
+}
+
+function thumbnailSetKey(url) {
+  try {
+    const filename = new URL(url).pathname.split("/").at(-1)?.replace(/\.[^.]+$/, "") || "";
+    if (/^(?:maxres|sd|hq|mq)?default$/i.test(filename) || filename === "0") return "default";
+    return filename || url;
+  } catch {
+    return url;
+  }
+}
+
+function showMetadataPage(pageName) {
+  metadataPages.forEach((page) => { page.hidden = page.dataset.metadataPage !== pageName; });
+  metadataPageButtons.forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.metadataPageButton === pageName));
+  });
+}
+
+metadataPageButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    if (!button.disabled) showMetadataPage(button.dataset.metadataPageButton);
+  });
+});
+
+function renderVideoMetadata(metadata) {
+  const firstReveal = !hasOpenedMetadataCard;
+  const booleanText = (value) => value === true ? "지원" : value === false ? "미지원" : "확인 불가";
+  const tagText = (values) => Array.isArray(values) && values.length ? values.join(", ") : "없음";
+  const rows = [
+    ["ID", metadata.video_id], ["채널", metadata.channel], ["날짜", formatUploadDate(metadata.upload_date)],
+    ["길이", formatMetadataDuration(metadata.duration_seconds)], ["조회수", formatMetadataNumber(metadata.view_count)],
+    ["좋아요", formatMetadataNumber(metadata.like_count)], ["댓글", formatMetadataNumber(metadata.comment_count)],
+    ["카테고리", tagText(metadata.categories)], ["태그", tagText(metadata.tags)],
+    ["자막", booleanText(metadata.subtitles_available)], ["캡션", booleanText(metadata.captions_available)],
+    ["채팅", booleanText(metadata.chat_replay_available)],
+  ];
+  metadataVideoTitle.textContent = metadataValue(metadata.title);
+  const savedThumbnails = Array.isArray(metadata.thumbnail_files) ? metadata.thumbnail_files : [];
+  const savedPrimary = savedThumbnails.find((thumbnail) => thumbnail?.is_primary);
+  const primaryThumbnailUrl = savedPrimary?.url || metadata.thumbnail || "";
+  metadataThumbnail.src = primaryThumbnailUrl;
+  metadataThumbnail.alt = metadata.title ? `${metadata.title} 썸네일` : "영상 썸네일";
+  metadataThumbnailLink.href = savedPrimary?.source_url || primaryThumbnailUrl;
+  metadataThumbnailLink.hidden = !primaryThumbnailUrl;
+  if (savedThumbnails.length) {
+    const thumbnails = savedThumbnails
+      .filter((thumbnail) => thumbnail?.url && !thumbnail.is_primary)
+      .sort((left, right) => String(left.url).localeCompare(String(right.url), "en"));
+    metadataThumbnailList.innerHTML = thumbnails.map((thumbnail, index) => {
+      const label = thumbnail.width && thumbnail.height
+        ? `${thumbnail.width} × ${thumbnail.height}`
+        : `${index + 1}번 썸네일`;
+      const originalUrl = thumbnail.source_url || thumbnail.url;
+      return `<a href="${escapeHtml(originalUrl)}" target="_blank" rel="noopener"><img src="${escapeHtml(thumbnail.url)}" alt="${escapeHtml(label)}"></a>`;
+    }).join("");
+  } else {
+    const mainThumbnailSet = thumbnailSetKey(metadata.thumbnail || "");
+    const thumbnailBySet = new Map();
+    (Array.isArray(metadata.thumbnails) ? metadata.thumbnails : []).forEach((thumbnail) => {
+      if (!thumbnail?.url) return;
+      const setKey = thumbnailSetKey(thumbnail.url);
+      if (setKey === mainThumbnailSet) return;
+      const existing = thumbnailBySet.get(setKey);
+      const area = Number(thumbnail.width || 0) * Number(thumbnail.height || 0);
+      const existingArea = Number(existing?.width || 0) * Number(existing?.height || 0);
+      if (!existing || area > existingArea) thumbnailBySet.set(setKey, thumbnail);
+    });
+    const thumbnails = [...thumbnailBySet.values()];
+    metadataThumbnailList.innerHTML = thumbnails.map((thumbnail, index) => {
+      const label = thumbnail.width && thumbnail.height
+        ? `${thumbnail.width} × ${thumbnail.height}`
+        : `${index + 1}번 썸네일`;
+      return `<a href="${escapeHtml(thumbnail.url)}" target="_blank" rel="noopener"><img src="${escapeHtml(thumbnail.url)}" alt="${escapeHtml(label)}"></a>`;
+    }).join("");
+  }
+  metadataList.innerHTML = rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(metadataValue(value))}</dd></div>`).join("");
+  metadataDescription.textContent = metadataValue(metadata.description, "설명이 없습니다.");
+  const chapters = Array.isArray(metadata.chapters) ? metadata.chapters : [];
+  metadataChapters.innerHTML = chapters.length
+    ? chapters.map((chapter) => `<tr><td>${escapeHtml(formatMetadataDuration(chapter.start_time))}</td><td>${escapeHtml(formatMetadataDuration(chapter.end_time))}</td><td>${escapeHtml(metadataValue(chapter.title, "제목 없음"))}</td></tr>`).join("")
+    : "<tr><td colspan=\"3\">제공되지 않습니다.</td></tr>";
+  const heatmap = Array.isArray(metadata.heatmap) ? metadata.heatmap : [];
+  const peak = Math.max(1, ...heatmap.map((point) => Number(point.value) || 0));
+  metadataHeatmapChart.innerHTML = heatmap.length
+    ? heatmap.map((point) => {
+      const value = Math.max(0, Number(point.value) || 0);
+      const height = Math.max(3, Math.round((value / peak) * 100));
+      const label = `${formatMetadataDuration(point.start_time)}–${formatMetadataDuration(point.end_time)} · 강도 ${value.toFixed(3)}`;
+      return `<span class="heatmap-bar" style="--heatmap-height: ${height}%" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></span>`;
+    }).join("")
+    : "<p class=\"muted\">제공되지 않습니다.</p>";
+  metadataHeatmap.innerHTML = heatmap.length
+    ? heatmap.map((point) => `<tr><td>${escapeHtml(formatMetadataDuration(point.start_time))}</td><td>${escapeHtml(formatMetadataDuration(point.end_time))}</td><td>${escapeHtml(metadataValue(point.value))}</td></tr>`).join("")
+    : "<tr><td colspan=\"3\">제공되지 않습니다.</td></tr>";
+  const availability = {
+    overview: true,
+    description: Boolean(metadata.description),
+    chapters: chapters.length > 0,
+    heatmap: heatmap.length > 0,
+  };
+  metadataPageButtons.forEach((button) => {
+    button.disabled = !availability[button.dataset.metadataPageButton];
+  });
+  showMetadataPage("overview");
+  if (!firstReveal) {
+    videoMetadataCard.hidden = false;
+    return;
+  }
+
+  hasOpenedMetadataCard = true;
+  const startCardReveal = () => {
+    videoMetadataCard.hidden = false;
+    void metadataCardBody.offsetWidth;
+    metadataCardBody.classList.add("metadata-card-first-reveal");
+    videoMetadataCard.classList.add("metadata-tabs-visible");
+    window.setTimeout(() => videoMetadataCard.classList.add("metadata-tabs-ready"), 140);
+  };
+  // Metadata must be ready and the upward move must have finished first.
+  window.setTimeout(startCardReveal, Math.max(0, metadataTransitionEndsAt - Date.now()));
+  metadataCardBody.addEventListener("animationend", () => {
+    metadataCardBody.classList.remove("metadata-card-first-reveal");
+    metadataPhase.classList.remove("metadata-awaiting-reveal");
+  }, { once: true });
+}
+
+async function fetchVideoMetadata(event) {
+  event?.preventDefault();
+  if (!metadataForm?.reportValidity()) return;
+  const requestedMetadataUrl = editVodUrl.value.trim();
+  if (requestedMetadataUrl === confirmedMetadataUrl) return;
+  const scrollPosition = window.scrollY;
+  beginMetadataTransition();
+  let metadataProgress = 0;
+  renderEditProgress({ progress: metadataProgress, status: "running", phase: "metadata", message: "yt-dlp로 영상 메타데이터를 수집하는 중입니다." });
+  metadataProgressTimer = window.setInterval(() => {
+    metadataProgress = Math.min(85, metadataProgress + 4);
+    renderEditProgress({ progress: metadataProgress, status: "running", phase: "metadata", message: "yt-dlp로 영상 메타데이터를 수집하는 중입니다." });
+  }, 350);
+  fetchMetadataButton.disabled = true;
+  continueToAnalysisButton.disabled = true;
+  videoMetadataCard.setAttribute("aria-busy", "true");
+  metadataMessage.textContent = "yt-dlp로 영상 메타데이터를 확인하는 중입니다.";
+  try {
+    const response = await fetch("/api/youtube/metadata", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: requestedMetadataUrl }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || "영상 메타데이터를 가져오지 못했습니다.");
+    window.clearInterval(metadataProgressTimer);
+    metadataProgressTimer = null;
+    renderEditProgress({ progress: 92, status: "running", phase: "metadata", message: "수집한 영상 정보를 화면에 반영하는 중입니다." });
+    renderVideoMetadata(data);
+    confirmedMetadataUrl = requestedMetadataUrl;
+    analysisVodUrl.value = confirmedMetadataUrl;
+    continueToAnalysisButton.disabled = false;
+    metadataMessage.textContent = "영상 정보를 확인했습니다. 분석 설정으로 진행할 수 있습니다.";
+    renderEditProgress({ progress: 100, status: "completed", phase: "metadata", message: "영상 정보 확인이 완료되었습니다." });
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: scrollPosition, behavior: "auto" });
+      updateProgressDock();
+    });
+  } catch (error) {
+    metadataMessage.textContent = error.message;
+    renderEditProgress({ progress: 0, status: "failed", phase: "metadata", message: error.message });
+  } finally {
+    if (metadataProgressTimer !== null) {
+      window.clearInterval(metadataProgressTimer);
+      metadataProgressTimer = null;
+    }
+    videoMetadataCard.removeAttribute("aria-busy");
+    fetchMetadataButton.disabled = false;
+  }
+}
+
+metadataForm?.addEventListener("submit", fetchVideoMetadata);
+editVodUrl?.addEventListener("click", () => editVodUrl.select());
+continueToAnalysisButton?.addEventListener("click", () => {
+  if (!confirmedMetadataUrl) return;
+  renderEditProgress({ progress: 100, status: "completed", phase: "metadata", message: "영상 정보 확인이 완료되었습니다." });
+  showPhase("analysis");
+});
+backToMetadataButton?.addEventListener("click", () => {
+  if (!isEditJobRunning) showPhase("metadata", { resetProgress: true });
+});
+
 function setMessage(target, text, type = "success") {
   const logger = type === "error" ? console.error : type === "warning" ? console.warn : console.info;
   logger(`[AI 영상 편집] ${text}`);
@@ -222,22 +477,77 @@ function renderEditProgress(data) {
   if (!editProgress) return;
   const progress = Math.max(0, Math.min(100, Number(data.progress) || 0));
   if (editProgressLabel) {
-    editProgressLabel.textContent = data.phase === "render" ? "선택 구간 렌더링" : "AI 분석 진행률";
+    editProgressLabel.textContent = data.phase === "metadata"
+      ? "영상 정보 확인 진행률"
+      : data.phase === "render" ? "선택 구간 렌더링" : "AI 분석 진행률";
   }
   editProgressPercent.textContent = `${progress}%`;
   editProgressBar.style.setProperty("--progress", `${progress}%`);
   editProgressBar.setAttribute("aria-valuenow", String(progress));
   editProgressMessage.textContent = data.message || "처리 중입니다.";
   editProgress.dataset.state = data.status || "running";
+  updateProgressElapsed(data.status, progress);
+}
+
+function formatProgressElapsed(seconds) {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  return `${String(Math.floor(totalSeconds / 60)).padStart(2, "0")}:${String(totalSeconds % 60).padStart(2, "0")}`;
+}
+
+function renderProgressElapsed() {
+  if (editProgressElapsed) editProgressElapsed.textContent = formatProgressElapsed(progressElapsedSeconds);
+}
+
+function startProgressElapsed() {
+  if (progressElapsedTimer !== null) return;
+  progressElapsedSeconds = 0;
+  progressElapsedStartedAt = Date.now();
+  if (editProgressElapsed) editProgressElapsed.hidden = false;
+  renderProgressElapsed();
+  progressElapsedTimer = window.setInterval(() => {
+    progressElapsedSeconds = (Date.now() - progressElapsedStartedAt) / 1000;
+    renderProgressElapsed();
+  }, 250);
+}
+
+function stopProgressElapsed() {
+  if (progressElapsedTimer === null) return;
+  window.clearInterval(progressElapsedTimer);
+  progressElapsedTimer = null;
+  progressElapsedSeconds = (Date.now() - progressElapsedStartedAt) / 1000;
+  renderProgressElapsed();
+}
+
+function resetProgressElapsed() {
+  if (progressElapsedTimer !== null) window.clearInterval(progressElapsedTimer);
+  progressElapsedTimer = null;
+  progressElapsedStartedAt = null;
+  progressElapsedSeconds = 0;
+  renderProgressElapsed();
+  if (editProgressElapsed) editProgressElapsed.hidden = true;
+}
+
+function updateProgressElapsed(status, progress) {
+  if (status === "idle") {
+    resetProgressElapsed();
+  } else if ((status === "queued" || status === "running") && progress === 0) {
+    startProgressElapsed();
+  } else if (status === "completed" || status === "failed" || status === "awaiting_selection") {
+    stopProgressElapsed();
+  }
+}
+
+function resetEditProgress(phase) {
+  resetProgressElapsed();
+  renderEditProgress({ progress: 0, status: "idle", phase, message: "작업을 준비하는 중입니다." });
 }
 
 function updateProgressDock() {
-  if (!editProgress || !progressDock) return;
-  const remaining = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
-  if (isProgressDocked ? remaining > 28 : remaining <= 2) {
-    isProgressDocked = !isProgressDocked;
-    editProgress.classList.toggle("docked", isProgressDocked);
-  }
+  if (!editProgress) return;
+  // Keep one fixed layout. Switching between fixed and document-docked modes
+  // when metadata changes made the progress area's apparent size fluctuate.
+  isProgressDocked = false;
+  editProgress.classList.remove("docked");
 }
 
 function setEditJobRunning(running) {
@@ -250,6 +560,7 @@ function setAnalysisFormBusy(busy) {
     element.disabled = busy;
   });
   startAnalysisButton.disabled = busy;
+  backToMetadataButton.disabled = busy;
 }
 
 window.addEventListener("scroll", updateProgressDock, { passive: true });
@@ -574,7 +885,7 @@ backToReviewButton?.addEventListener("click", () => {
   else showPhase("analysis", { resetProgress: true });
 });
 restartAnalysisButton?.addEventListener("click", () => {
-  if (!isEditJobRunning) showPhase("analysis", { resetProgress: true });
+  if (!isEditJobRunning) showPhase("metadata", { resetProgress: true });
 });
 
 renderSelectedButton?.addEventListener("click", async () => {
@@ -712,6 +1023,7 @@ async function startAnalysis(event) {
   };
   setAnalysisFormBusy(true);
   setEditJobRunning(true);
+  renderEditProgress({ progress: 0, status: "queued", phase: "analysis", message: "AI 분석 작업을 준비하는 중입니다." });
   const generation = ++editPollGeneration;
   const submittedFingerprint = analysisSettingsFingerprint();
   segmentReviewer.hidden = true;
@@ -757,7 +1069,7 @@ logoutButton.addEventListener("click", async () => {
 
 editForm?.addEventListener("submit", startAnalysis);
 
-showPhase("analysis");
+showPhase("metadata");
 
 loadConfig().catch((error) => {
   setStatus("Supabase 설정 필요", "error");

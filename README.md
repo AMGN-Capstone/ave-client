@@ -137,13 +137,28 @@ status                작업 상태
 
 실제 영상 파일은 DB에 직접 저장하지 않고 비공개 Storage bucket에 저장합니다. DB에는 파일 경로만 저장합니다.
 
+로컬 `media`는 원본과 작업 결과를 엄격히 분리합니다. `yt-data/<video_id>`에는
+yt-dlp가 만든 원본 파일만 보관하며 서비스가 이를 수정하거나 서비스용 필드를
+추가하지 않습니다. 서비스가 만든 채팅 정규화본, 전사본, 편집 계획, 렌더 결과,
+업로드 파일 등은 모두 `yt-edit/<job_id>`에 보관합니다.
+
+```text
+media/
+├── yt-data/
+│   └── video_id/          # yt-dlp output only: ID.mp4, ID.info.json, ID.ko.vtt …
+│       └── thumbnails/    # sddefault.jpg, sd1.jpg, sd2.jpg, sd3.jpg만 저장
+└── yt-edit/
+    ├── job_id/            # import.json, chat-replay.jsonl, transcripts, plans, renders …
+    └── uploads/upload_id/ # locally uploaded source video
+```
+
 ```text
 longform-media/
 └── user_id/
     └── job_id/
         ├── video.mp4
         ├── subtitle-0.vtt
-        ├── metadata.json
+        ├── video_id.info.json
         └── rendered.mp4
 ```
 
@@ -203,17 +218,17 @@ python -m uvicorn app.main:app --reload
 
 기본 입력은 **이미 업로드되어 재생 가능한 YouTube 영상 URL**입니다. 방송 중 채팅을 별도로 수집하거나, 종료 뒤 다시보기와 결합할 필요가 없습니다.
 
-1. Google 로그인 후 업로드 완료된 YouTube 영상 URL을 입력합니다.
-2. 서버가 영상 ID를 확인하고 `pytchat`으로 채팅 리플레이를 한 번 수집합니다.
+1. 업로드 완료된 YouTube 영상 URL을 입력하면 `yt-dlp`가 썸네일, 통계, 자막·캡션, 챕터, 히트맵 등 공개 메타데이터를 확인합니다.
+2. 메타데이터 확인 후 분석 설정을 선택하고, 서버가 영상 ID를 확인해 `yt-dlp`로 채팅 리플레이를 한 번 수집합니다.
 3. 리플레이가 있으면 `elapsedTime`에 사용자가 지정한 지연 보정을 적용하고, 각 스크립트 클러스터 시간 범위의 평균 채팅 밀도를 계산합니다.
 4. 리플레이가 없거나 수집에 실패해도 작업을 중단하지 않고 자막 기반 분석으로 계속 진행합니다.
-5. 같은 YouTube 영상 ID의 원본 영상과 VTT 자막이 이미 있으면 `media/youtube/cache-<video_id>` 또는 기존 저장 폴더에서 재사용하고, 둘 중 하나라도 없으면 새로 수집합니다.
+5. 같은 YouTube 영상 ID의 원본 영상과 VTT 자막이 이미 있으면 `media/yt-data/<video_id>`에서 재사용하고, 둘 중 하나라도 없으면 새로 수집합니다.
 6. `yt-dlp`로 영상과 한국어 자막을 수집하고, 필요할 때만 Gemini 자막 정제를 실행합니다. 정제 응답은 변경된 `id`, `text`, `keep`만 반환합니다.
 7. 요약과 주제 챕터는 시간 대신 자막 `id` 경계로 생성하고, 서버가 실제 시간으로 검증·변환합니다. 청크 경계는 인접 요약을 한 번 더 검토합니다.
 8. 모든 스크립트 클러스터를 Gemini가 `id`, `text`만으로 평가합니다. 채팅 반응은 보조 분석값으로 보존하지만 중요도 점수를 미리 거르는 기준으로 쓰지 않습니다.
 9. AI 추천 후보를 사용자가 검토·선택한 뒤 선택 구간만 렌더링합니다.
 
-채팅 리플레이는 선택적 보조 신호입니다. `pytchat`은 비공식 라이브러리이므로 YouTube 변경에 따라 수집이 실패할 수 있지만, 그 경우에도 자막 기반 편집을 계속할 수 있습니다.
+채팅 리플레이는 선택적 보조 신호입니다. `yt-dlp`가 리플레이를 제공하지 않거나 수집에 실패해도 자막 기반 편집을 계속할 수 있습니다.
 
 ### 로컬 실행
 
@@ -231,6 +246,7 @@ python -m uvicorn app.main:app --reload
 ### 주요 API
 
 - `POST /api/youtube/edit/start`: 업로드 완료 영상 분석 작업 시작. 채팅 리플레이는 있으면 사용하고 없으면 건너뜀
+- `POST /api/youtube/metadata`: `yt-dlp`로 URL의 공개 메타데이터 조회
 - `GET /api/youtube/edit/status/{job_id}`: 분석·렌더링 작업 상태 조회
 - `POST /api/videos/upload`: 별도 승인된 로컬 원본을 보관할 때 사용하는 MVP API
 

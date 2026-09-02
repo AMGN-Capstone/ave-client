@@ -44,6 +44,10 @@ class LiveYouTubeRequest(BaseModel):
     url: str = Field(..., min_length=1)
 
 
+class YouTubeMetadataRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="확인할 YouTube 영상 URL")
+
+
 class LiveChatResponse(BaseModel):
     messages: list[dict] = Field(default_factory=list)
     next_page_token: str | None = None

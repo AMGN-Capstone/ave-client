@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -20,6 +21,7 @@ from app.schemas import (
     YouTubeImportResponse,
     LiveChatResponse,
     LiveYouTubeRequest,
+    YouTubeMetadataRequest,
     LiveFinalizeRequest,
     LiveFinalizeResponse,
     LiveEditRequest,
@@ -197,8 +199,8 @@ async def import_youtube_video(
 
         metadata_path = _local_path(result.get("metadata_path"))
         if metadata_path and metadata_path.exists():
-            storage_paths["metadata"] = f"{user_id}/{job_id}/metadata.json"
-            upload_file(storage_paths["metadata"], metadata_path, "application/json")
+            storage_paths["info"] = f"{user_id}/{job_id}/info.json"
+            upload_file(storage_paths["info"], metadata_path, "application/json")
 
         metadata = {}
         if metadata_path and metadata_path.exists():
@@ -252,7 +254,7 @@ async def import_youtube_video(
             "subtitle_files": [
                 path for key, path in storage_paths.items() if key.startswith("subtitle_")
             ],
-            "metadata_path": storage_paths.get("metadata", ""),
+            "metadata_path": storage_paths.get("info", ""),
         }
     except InvalidYouTubeURLError as exc:
         update_row("processing_jobs", job_id, {"status": "failed", "error_message": str(exc)})
@@ -273,10 +275,11 @@ async def upload_video(file: UploadFile = File(...)):
     if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Unsupported video format.")
 
-    upload_dir = get_media_root() / "uploads"
+    upload_id = uuid4().hex
+    upload_dir = get_media_root() / "yt-edit" / "uploads" / upload_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    stored_filename = f"{uuid4().hex}{extension}"
+    stored_filename = f"{upload_id}{extension}"
     stored_path = upload_dir / stored_filename
     size_bytes = 0
 
@@ -359,13 +362,12 @@ async def _run_live_edit_job(
     try:
         _update_live_edit_job(job_id, status="running", progress=3, message="업로드된 영상을 확인하는 중입니다.")
         vod_id = extract_video_id(request.vod_url)
-        archive_key = f"vod-{vod_id}"
-        archive_path = _chat_archive_path(archive_key)
+        archive_path = _chat_archive_path(job_id)
 
         if not archive_path.exists() or archive_path.stat().st_size == 0:
             _update_live_edit_job(job_id, progress=8, message="지원되는 채팅 리플레이를 확인하는 중입니다.")
             try:
-                await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+                await asyncio.to_thread(collect_chat_replay, vod_id, job_id)
             except LiveYouTubeError:
                 # Chat replay is an optional signal. A completed video without
                 # replay chat must still be editable from its transcript.
@@ -447,6 +449,26 @@ async def start_live_edit(
     return LIVE_EDIT_JOBS[job_id]
 
 
+@app.post("/api/youtube/metadata")
+async def youtube_metadata(request: YouTubeMetadataRequest):
+    """Return the phase-one preview data using yt-dlp only."""
+    try:
+        extract_video_id(request.url)
+        return await asyncio.to_thread(get_video_metadata, request.url)
+    except LiveYouTubeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/youtube/thumbnail/{video_id}/{filename}")
+async def youtube_thumbnail(video_id: str, filename: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) or Path(filename).name != filename:
+        raise HTTPException(status_code=404, detail="썸네일을 찾을 수 없습니다.")
+    path = get_media_root() / "yt-data" / video_id / "thumbnails" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="썸네일을 찾을 수 없습니다.")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/api/youtube/edit/status/{job_id}")
 @app.get("/api/youtube/live/edit/status/{job_id}", deprecated=True)
 async def live_edit_status(job_id: str):
@@ -523,7 +545,7 @@ async def _run_segment_selection_job(
 def _edit_output_dir(job_id: str) -> Path:
     if not job_id or Path(job_id).name != job_id:
         raise HTTPException(status_code=400, detail="잘못된 편집 작업 ID입니다.")
-    directory = get_media_root() / "youtube-live-edit" / job_id
+    directory = get_media_root() / "yt-edit" / job_id
     if not directory.exists() or not directory.is_dir():
         raise HTTPException(status_code=404, detail="편집 작업을 찾을 수 없습니다.")
     return directory
@@ -641,20 +663,21 @@ async def edit_live_youtube(
 
     try:
         vod_id = extract_video_id(request.vod_url)
-        archive_key = f"vod-{vod_id}"
-        archive_path = _chat_archive_path(archive_key)
+        job_id = uuid4().hex
+        archive_path = _chat_archive_path(job_id)
 
         # Replay chat is optional. Its absence must not block transcript-led
         # editing of an already uploaded video.
         if not archive_path.exists() or archive_path.stat().st_size == 0:
             try:
-                await asyncio.to_thread(collect_chat_replay, vod_id, archive_key)
+                await asyncio.to_thread(collect_chat_replay, vod_id, job_id)
             except LiveYouTubeError:
                 pass
 
         pipeline = LiveEditPipeline(get_media_root())
         result = await asyncio.to_thread(
             pipeline.run,
+            job_id=job_id,
             vod_url=request.vod_url,
             archive_path=archive_path,
             genre=request.genre,
@@ -681,18 +704,17 @@ async def edit_live_youtube(
 @app.post("/api/youtube/live/finalize", response_model=LiveFinalizeResponse)
 async def finalize_live_youtube(
     request: LiveFinalizeRequest,
-    youtube_access_token: str = Header(..., alias="X-YouTube-Access-Token"),
 ):
     """Attach a completed VOD URL to the chat captured during the live event."""
 
     try:
         vod_id = extract_video_id(request.vod_url)
-        vod = get_video_metadata(youtube_access_token, vod_id)
+        vod = await asyncio.to_thread(get_video_metadata, request.vod_url)
         archive_key = request.live_chat_id or f"vod-{vod_id}"
         archive_path = _chat_archive_path(archive_key)
         replay_warning = None
 
-        # Prefer replay timestamps from pytchat. If it is unavailable or the
+        # Prefer replay timestamps from yt-dlp. If it is unavailable or the
         # VOD has no replay, retain the official live-capture fallback.
         try:
             replay_result = await asyncio.to_thread(
@@ -740,7 +762,7 @@ async def finalize_live_youtube(
             "analysis": analysis,
             "source_video_required": True,
             "message": (
-                "채팅 분석이 완료되었습니다. pytchat 리플레이 시간을 기준으로 "
+                "채팅 분석이 완료되었습니다. yt-dlp 리플레이 시간을 기준으로 "
                 "하이라이트 후보를 생성했습니다."
             ),
         }

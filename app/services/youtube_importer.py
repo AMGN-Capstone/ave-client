@@ -92,7 +92,7 @@ class YouTubeImporter:
         video_id = self._video_id_from_url(url)
         # A video ID is stable across edit jobs. Keeping newly imported assets
         # here makes later edit requests reuse both the source and its VTT.
-        job_dir = self.media_root / "youtube" / f"cache-{video_id or job_id}"
+        job_dir = self.media_root / "yt-data" / (video_id or job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
 
         prefer_merged_formats = self._has_ffmpeg()
@@ -152,20 +152,22 @@ class YouTubeImporter:
         video_id = self._video_id_from_url(url)
         if not video_id:
             return None
-        root = self.media_root / "youtube"
+        root = self.media_root / "yt-data"
         if not root.exists():
             return None
 
-        candidates = [root / f"cache-{video_id}"]
-        # Older revisions used edit-{job_id}; retain their downloaded assets.
+        candidates = [root / video_id]
         candidates.extend(path for path in root.iterdir() if path.is_dir() and path not in candidates)
         matches: list[tuple[float, Path, Path, list[Path], dict]] = []
         for directory in candidates:
-            metadata_path = directory / "metadata.json"
+            info_paths = sorted(directory.glob("*.info.json"))
             metadata: dict = {}
-            if metadata_path.exists():
+            if info_paths:
                 try:
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    stored_info = json.loads(info_paths[0].read_text(encoding="utf-8"))
+                    # ``yt-data`` contains the unmodified info JSON produced by
+                    # yt-dlp.  Service state is deliberately kept in ``yt-edit``.
+                    metadata = stored_info
                 except (OSError, json.JSONDecodeError):
                     metadata = {}
             known_id = self._video_id_from_url(str(metadata.get("source_url") or metadata.get("webpage_url") or ""))
@@ -188,7 +190,8 @@ class YouTubeImporter:
             return None
 
         _, directory, video, subtitles, metadata = max(matches, key=lambda item: item[0])
-        metadata_path = directory / "metadata.json"
+        info_paths = sorted(directory.glob("*.info.json"))
+        metadata_path = info_paths[0] if info_paths else directory / f"{video_id}.info.json"
         return {
             "job_id": job_id,
             "source_url": url,
@@ -215,7 +218,7 @@ class YouTubeImporter:
             # DASH streams whose URLs require a PO token and then return 403.
             # Users can opt back into a higher-quality selector via env.
             "format": format_selector or "best[ext=mp4]/best",
-            "outtmpl": str(job_dir / "%(title).120s-%(id)s.%(ext)s"),
+            "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
             "writeautomaticsub": include_subtitles,
             "writesubtitles": include_subtitles,
             # The editor only consumes Korean captions. Requesting English as
@@ -223,7 +226,6 @@ class YouTubeImporter:
             "subtitleslangs": ["ko"] if include_subtitles else [],
             "subtitlesformat": "vtt",
             "writeinfojson": True,
-            "writethumbnail": True,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -366,7 +368,10 @@ class YouTubeImporter:
         subtitle_files: list[Path],
         warnings: list[str],
     ) -> Path:
-        metadata = {
+        info_path = job_dir / f"{info.get('id') or job_dir.name}.info.json"
+        work_dir = self.media_root / "yt-edit" / job_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        import_record = {
             "job_id": job_id,
             "source_url": url,
             "title": info.get("title"),
@@ -379,9 +384,11 @@ class YouTubeImporter:
             "subtitle_files": [relative_to_cwd(path) for path in subtitle_files],
             "warnings": warnings,
         }
-        metadata_path = job_dir / "metadata.json"
-        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        return metadata_path
+        (work_dir / "import.json").write_text(
+            json.dumps(import_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return info_path
 
     def _find_video_file(self, job_dir: Path, info: dict) -> Path | None:
         for item in info.get("requested_downloads") or []:

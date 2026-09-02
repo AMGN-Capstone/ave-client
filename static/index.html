@@ -22,19 +22,62 @@
       </div>
     </header>
 
-    <main class="workspace">
-      <section class="tool-panel primary-panel phase-panel" id="analysisPhase" data-phase="analysis" aria-labelledby="editTitle">
+    <main class="workspace phase-one-idle">
+      <section class="tool-panel primary-panel phase-panel" id="metadataPhase" data-phase="metadata" aria-labelledby="metadataTitle">
         <div class="section-heading">
           <span class="step-index">01</span>
           <div>
+            <h2 id="metadataTitle">영상 URL 확인</h2>
+            <p>YouTube 영상 URL을 입력해 편집 전에 공개 메타데이터와 지원 기능을 확인하세요.</p>
+          </div>
+        </div>
+        <form id="metadataForm" class="stacked-form">
+          <label for="editVodUrl">업로드 완료된 YouTube 영상 URL</label>
+          <div class="inline-control">
+            <input id="editVodUrl" name="vod_url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" required>
+            <button id="fetchMetadataButton" type="submit" class="secondary-button">정보 확인</button>
+          </div>
+        </form>
+        <p id="metadataMessage" class="progress-message" aria-live="polite">영상 URL을 입력한 뒤 정보 확인을 누르세요.</p>
+        <div id="videoMetadataCard" class="video-metadata-card-shell" hidden aria-live="polite">
+          <nav class="metadata-page-tabs" aria-label="메타데이터 페이지">
+            <button type="button" data-metadata-page-button="overview" aria-controls="metadataOverviewPage">개요</button>
+            <button type="button" data-metadata-page-button="description" aria-controls="metadataDescriptionPage">설명</button>
+            <button type="button" data-metadata-page-button="chapters" aria-controls="metadataChaptersPage">챕터</button>
+            <button type="button" data-metadata-page-button="heatmap" aria-controls="metadataHeatmapPage">히트맵</button>
+          </nav>
+          <article class="video-metadata-card">
+          <section id="metadataOverviewPage" class="metadata-page" data-metadata-page="overview">
+            <div class="metadata-thumbnail-strip">
+              <a id="metadataThumbnailLink" class="metadata-thumbnail-link" target="_blank" rel="noopener">
+                <img id="metadataThumbnail" class="metadata-thumbnail" alt="">
+              </a>
+              <div id="metadataThumbnailList" class="metadata-thumbnail-list"></div>
+            </div>
+            <h3 id="metadataVideoTitle"></h3>
+            <dl id="metadataList" class="metadata-list"></dl>
+          </section>
+          <section id="metadataDescriptionPage" class="metadata-page" data-metadata-page="description" hidden><div class="metadata-description-card"><p id="metadataDescription" class="metadata-description"></p></div></section>
+          <section id="metadataChaptersPage" class="metadata-page" data-metadata-page="chapters" hidden><table class="metadata-table"><colgroup><col><col><col></colgroup><thead><tr><th>시작</th><th>종료</th><th>제목</th></tr></thead><tbody id="metadataChapters"></tbody></table></section>
+          <section id="metadataHeatmapPage" class="metadata-page" data-metadata-page="heatmap" hidden><div id="metadataHeatmapChart" class="heatmap-chart" role="img" aria-label="영상 히트맵"></div><table class="metadata-table"><colgroup><col><col><col></colgroup><thead><tr><th>시작</th><th>종료</th><th>강도</th></tr></thead><tbody id="metadataHeatmap"></tbody></table></section>
+          </article>
+        </div>
+        <div class="phase-actions">
+          <button id="continueToAnalysisButton" type="button" class="secondary-button" title="분석 설정으로 이동" aria-label="분석 설정으로 이동" disabled>다음</button>
+        </div>
+      </section>
+
+      <section class="tool-panel primary-panel phase-panel" id="analysisPhase" data-phase="analysis" aria-labelledby="editTitle" hidden>
+        <div class="section-heading">
+          <span class="step-index">02</span>
+          <div>
             <h2 id="editTitle">영상 분석 및 편집 후보 만들기</h2>
-            <p>이미 업로드된 YouTube 영상 URL을 입력하세요. 채팅 리플레이가 지원되면 자동 수집해 스크립트 구간별 밀도를 표시하며, 없으면 자막 분석만으로 계속 진행합니다.</p>
+            <p>확인한 영상의 자막과 채팅 리플레이를 분석해 편집 후보를 만듭니다.</p>
           </div>
         </div>
 
         <form id="editForm" class="stacked-form">
-          <label for="editVodUrl">업로드 완료된 YouTube 영상 URL</label>
-          <input id="editVodUrl" name="vod_url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" required>
+          <input id="analysisVodUrl" name="vod_url" type="hidden" required>
           <div class="settings-grid">
             <label>
               <span class="setting-title">LLM 엔진</span>
@@ -120,14 +163,15 @@
             </label>
           </div>
           <div class="phase-actions">
-            <button id="startAnalysisButton" type="button" class="secondary-button"><span class="button-long">다음: AI 분석 및 후보 만들기</span><span class="button-short">다음</span></button>
+            <button id="backToMetadataButton" type="button" class="ghost-button" title="영상 URL 확인으로 이동" aria-label="영상 URL 확인으로 이동">이전</button>
+            <button id="startAnalysisButton" type="button" class="secondary-button" title="AI 분석을 시작하고 편집 후보를 생성" aria-label="AI 분석을 시작하고 편집 후보를 생성">다음</button>
           </div>
         </form>
       </section>
 
       <section class="tool-panel edit-review-panel phase-panel" id="segmentReviewer" data-phase="review" aria-labelledby="segmentReviewTitle" hidden>
         <div class="section-heading">
-          <span class="step-index">02</span>
+          <span class="step-index">03</span>
           <div>
             <h2 id="segmentReviewTitle">구간 검토 및 영상 생성</h2>
             <p>AI 추천을 시작점으로 사용하고, 원본을 미리 보면서 포함할 구간을 직접 선택하세요.</p>
@@ -176,8 +220,8 @@
             <div class="selection-footer">
               <p id="segmentReviewMessage" class="progress-message" aria-live="polite"></p>
               <div class="phase-actions">
-                <button id="backToAnalysisButton" type="button" class="ghost-button"><span class="button-long">이전: 분석 설정</span><span class="button-short">이전</span></button>
-                <button id="renderSelectedButton" type="button" class="secondary-button" disabled><span class="button-long">다음: 선택 구간으로 영상 생성</span><span class="button-short">다음</span></button>
+                <button id="backToAnalysisButton" type="button" class="ghost-button" title="분석 설정으로 이동" aria-label="분석 설정으로 이동">이전</button>
+                <button id="renderSelectedButton" type="button" class="secondary-button" title="선택한 구간으로 영상 생성" aria-label="선택한 구간으로 영상 생성" disabled>다음</button>
               </div>
             </div>
           </div>
@@ -186,7 +230,7 @@
 
       <section class="tool-panel phase-panel" id="renderPhase" data-phase="render" aria-labelledby="renderTitle" hidden>
         <div class="section-heading">
-          <span class="step-index">03</span>
+          <span class="step-index">04</span>
           <div>
             <h2 id="renderTitle">렌더링 결과 및 자막 수정</h2>
             <p>선택 구간으로 만든 영상을 확인하고, 필요하면 SRT 자막을 수정해 다시 생성하세요.</p>
@@ -221,8 +265,8 @@
           <p id="subtitleEditorMessage" class="progress-message"></p>
         </div>
         <div class="phase-actions">
-          <button id="backToReviewButton" type="button" class="ghost-button"><span class="button-long">이전: 구간 검토</span><span class="button-short">이전</span></button>
-          <button id="restartAnalysisButton" type="button" class="ghost-button"><span class="button-long">처음으로</span><span class="button-short">처음</span></button>
+          <button id="backToReviewButton" type="button" class="ghost-button" title="구간 검토로 이동" aria-label="구간 검토로 이동">이전</button>
+          <button id="restartAnalysisButton" type="button" class="ghost-button" title="영상 URL 확인부터 다시 시작" aria-label="영상 URL 확인부터 다시 시작">처음</button>
         </div>
       </section>
     </main>
@@ -237,7 +281,10 @@
         <div id="editProgressBar" class="progress-track" role="progressbar" aria-label="AI 영상 편집 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
           <span></span>
         </div>
-        <p id="editProgressMessage" class="progress-message">작업을 준비하는 중입니다.</p>
+        <div class="progress-detail-row">
+          <p id="editProgressMessage" class="progress-message">작업을 준비하는 중입니다.</p>
+          <time id="editProgressElapsed" class="progress-elapsed" hidden>00:00</time>
+        </div>
       </div>
       <div class="progress-spacer" aria-hidden="true"></div>
       <div id="footerActions" class="footer-actions"></div>
@@ -246,20 +293,5 @@
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script src="/static/script.js"></script>
-    <script>
-      (() => {
-        const button = document.querySelector("#startAnalysisButton");
-        const actions = button?.closest(".phase-actions");
-        const footer = document.querySelector("#footerActions");
-        if (actions && footer) footer.replaceChildren(actions);
-        if (button && !button.dataset.analysisBound) {
-          button.addEventListener("click", (event) => {
-            event.preventDefault();
-            if (!document.querySelector("#editForm")?.reportValidity()) return;
-            window.startAnalysis?.(event);
-          });
-        }
-      })();
-    </script>
   </body>
 </html>

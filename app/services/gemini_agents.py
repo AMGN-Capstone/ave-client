@@ -197,7 +197,13 @@ class GeminiAgents:
         self.model = self.gateway.model
         self.max_input_chars = self.gateway.max_input_chars
         self.timeout = timeout
-        self.cache_dir = Path(os.getenv("GEMINI_CACHE_DIR", "media/gemini-cache")).resolve()
+        provider_cache_env = f"LLM_{self.provider.upper()}_CACHE_DIR"
+        legacy_gemini_cache = os.getenv("GEMINI_CACHE_DIR") if self.provider == "gemini" else None
+        self.cache_dir = Path(
+            os.getenv(provider_cache_env)
+            or legacy_gemini_cache
+            or f"media/llm-{self.provider}-cache"
+        ).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.min_request_interval = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "2.0"))
         self._last_request_at = 0.0
