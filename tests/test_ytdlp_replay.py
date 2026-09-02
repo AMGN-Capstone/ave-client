@@ -96,7 +96,7 @@ def test_ytdlp_replay_is_saved_with_elapsed_seconds(tmp_path, monkeypatch):
             (output_dir / "video-id.live_chat.json").write_text(json.dumps(action) + "\n", encoding="utf-8")
             return {}
 
-    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    monkeypatch.setattr("app.services.live_youtube_service.YoutubeDL", FakeYoutubeDL)
 
     result = collect_chat_replay("video-id", "chat-id")
 

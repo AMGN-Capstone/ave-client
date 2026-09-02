@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from app.config import get_media_root
+from app.services.ytdlp_binary import YoutubeDL
 
 
 YOUTUBE_API_ROOT = "https://www.googleapis.com/youtube/v3"
@@ -219,11 +220,6 @@ def _normalize_ytdlp_replay_action(action: dict) -> list[dict]:
 
 def collect_chat_replay(video_id: str, archive_key: str) -> dict:
     """Download and normalize an archived live-chat replay with yt-dlp."""
-
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError as exc:
-        raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
 
     output_dir = get_media_root() / "yt-data" / video_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -621,7 +617,6 @@ def get_video_metadata(url: str) -> dict:
                 # extraction itself is not repeated.
                 if not thumbnail_files and info.get("thumbnails"):
                     try:
-                        from yt_dlp import YoutubeDL
                         with YoutubeDL({"quiet": True, "no_warnings": True}) as downloader:
                             thumbnail_files = _download_thumbnail_list(
                                 downloader,
@@ -636,10 +631,6 @@ def get_video_metadata(url: str) -> dict:
             pass
 
     if info is None:
-        try:
-            from yt_dlp import YoutubeDL
-        except ImportError as exc:
-            raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
         try:
             with YoutubeDL({
                 "skip_download": True,
@@ -724,11 +715,6 @@ def get_video_metadata(url: str) -> dict:
 def download_live_captions(url: str) -> dict:
     """Ask yt-dlp for currently exposed live captions without downloading video."""
 
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError as exc:
-        raise LiveYouTubeError("yt-dlp가 설치되어 있지 않습니다.") from exc
-
     video_id = extract_video_id(url)
     job_dir = get_media_root() / "yt-data" / video_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -755,22 +741,8 @@ def download_live_captions(url: str) -> dict:
         if "429" in message or "Too Many Requests" in message:
             warnings.append(
                 "YouTube가 자막 요청을 일시적으로 제한했습니다(HTTP 429). "
-                "오디오를 내려받아 faster-whisper 로컬 STT를 시도합니다."
+                "로컬 Whisper 대체 처리는 지원하지 않습니다. AVE Whisper API를 사용하세요."
             )
-            try:
-                fallback = _transcribe_downloaded_audio(url, job_dir)
-                return {
-                    "title": info.get("title") or fallback.get("title"),
-                    "channel": info.get("channel") or fallback.get("channel"),
-                    "is_live": info.get("is_live"),
-                    "duration": info.get("duration") or fallback.get("duration"),
-                    "subtitle_files": [],
-                    "subtitle_text": fallback["subtitle_text"],
-                    "transcript": fallback["transcript"],
-                    "warnings": warnings + fallback.get("warnings", []),
-                }
-            except Exception as fallback_exc:
-                warnings.append(f"로컬 STT도 실패했습니다: {fallback_exc}")
         else:
             warnings.append(f"자막을 가져오지 못했습니다: {message}")
 
@@ -792,39 +764,3 @@ def download_live_captions(url: str) -> dict:
     }
 
 
-def _transcribe_downloaded_audio(url: str, job_dir: Path) -> dict:
-    """Download an audio-only source and transcribe it locally."""
-
-    try:
-        from yt_dlp import YoutubeDL
-        from app.services.local_video_transcriber import transcript_as_text
-        from app.services.transcription_service import transcribe_media
-    except ImportError as exc:
-        raise LiveYouTubeError(
-            "로컬 STT를 사용하려면 yt-dlp와 faster-whisper를 설치하세요."
-        ) from exc
-
-    audio_dir = job_dir / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": str(audio_dir / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with YoutubeDL(options) as downloader:
-        info = downloader.extract_info(url, download=True)
-
-    audio_files = [path for path in audio_dir.glob(f"{extract_video_id(url)}.*") if path.is_file()]
-    if not audio_files:
-        raise LiveYouTubeError("오디오 파일을 찾지 못했습니다.")
-
-    transcript = transcribe_media(audio_files[0])
-    return {
-        "title": info.get("title"),
-        "channel": info.get("channel") or info.get("uploader"),
-        "duration": info.get("duration"),
-        "subtitle_text": transcript_as_text(transcript),
-        "transcript": transcript,
-        "warnings": [],
-    }

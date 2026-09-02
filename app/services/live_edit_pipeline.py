@@ -18,9 +18,10 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from app.config import get_media_root
-from app.services.azure_media_service import AzureMediaError, delete_uploaded_audio, upload_audio_for_transcription
+from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
+from app.services.server_media_service import ServerMediaError, transcribe_uploaded_audio, upload_audio_for_transcription
 from app.services.gemini_agents import GeminiAgents
-from app.services.whisper_api_service import WhisperAPIError, transcribe_with_whisper_api
+from app.services.local_job_store import LocalJobStore
 from app.services.youtube_importer import YouTubeImporter
 
 
@@ -724,6 +725,13 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise LiveEditPipelineError(completed.stderr[-3000:] or "ffmpeg 편집에 실패했습니다.")
 
 
+def _ffmpeg_binary() -> str:
+    try:
+        return str(get_ffmpeg())
+    except ToolchainError as exc:
+        raise LiveEditPipelineError(str(exc)) from exc
+
+
 def _burn_subtitles(
     source: Path,
     subtitles: Path,
@@ -731,9 +739,7 @@ def _burn_subtitles(
     font_name: str = "Malgun Gothic",
     font_size: int = 18,
 ) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise LiveEditPipelineError("ffmpeg가 설치되어 있지 않습니다.")
+    ffmpeg = _ffmpeg_binary()
     filter_path = str(subtitles.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
     safe_font_name = re.sub(r"[\\:'&,]", "", str(font_name)).strip() or "Malgun Gothic"
     safe_font_size = max(8, min(64, int(font_size)))
@@ -758,9 +764,7 @@ def render_preview(
     font_size: int = 18,
     progress_callback: Callable[[float], None] | None = None,
 ) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise LiveEditPipelineError("ffmpeg가 설치되어 있지 않습니다.")
+    ffmpeg = _ffmpeg_binary()
     with tempfile.TemporaryDirectory(prefix="live-edit-") as temp_name:
         temp = Path(temp_name)
         files = []
@@ -806,9 +810,7 @@ def render_exact(
     font_size: int = 18,
     progress_callback: Callable[[float], None] | None = None,
 ) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise LiveEditPipelineError("ffmpeg가 설치되어 있지 않습니다.")
+    ffmpeg = _ffmpeg_binary()
     with tempfile.TemporaryDirectory(prefix="live-edit-exact-") as temp_name:
         joined = Path(temp_name) / "joined.mp4"
         video_parts = []
@@ -835,8 +837,9 @@ def render_exact(
 
 
 class LiveEditPipeline:
-    def __init__(self, media_root: Path | None = None):
+    def __init__(self, media_root: Path | None = None, database_root: Path | None = None):
         self.media_root = (media_root or get_media_root()).resolve()
+        self.store = LocalJobStore((database_root or self.media_root).resolve())
 
     def run(
         self,
@@ -862,6 +865,7 @@ class LiveEditPipeline:
         render_mode: str = "preview",
         defer_render: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
+        server_access_token: str | None = None,
     ) -> dict[str, Any]:
         def report(progress: int, message: str) -> None:
             if progress_callback:
@@ -903,35 +907,26 @@ class LiveEditPipeline:
 
         raw_segments = parse_vtt(subtitle) if subtitle else []
         if transcription_source == "whisper_api":
-            (output_dir / "edit_plan.json").write_text(
-                json.dumps({"source_video_path": str(source.resolve())}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            report(22, "음원을 Azure 전사 저장소에 올리는 중입니다.")
+            report(22, "음원을 AVE 서버에 올리는 중입니다.")
             try:
-                uploaded_audio = upload_audio_for_transcription(source, job_id)
+                uploaded_audio = upload_audio_for_transcription(source, server_access_token or "")
                 report(25, "Whisper API로 음성을 전사하는 중입니다. 처음 요청은 모델 준비로 오래 걸릴 수 있습니다.")
-                raw_segments = transcribe_with_whisper_api(
-                    uploaded_audio.public_url,
+                raw_segments = transcribe_uploaded_audio(
+                    uploaded_audio.file_id,
+                    server_access_token or "",
                     language=stt_language,
                     initial_prompt=stt_initial_prompt,
                     hotwords=stt_hotwords,
                     speed=stt_speed,
                 )["segments"]
-            except (AzureMediaError, WhisperAPIError) as exc:
+            except ServerMediaError as exc:
                 raise LiveEditPipelineError(str(exc)) from exc
-            finally:
-                if "uploaded_audio" in locals():
-                    try:
-                        delete_uploaded_audio(uploaded_audio.remote_name)
-                    except AzureMediaError:
-                        pass
         if not raw_segments:
             raise LiveEditPipelineError("자막 파일은 있지만 시간표시 문장을 읽지 못했습니다.")
 
         raw_segments = [{**segment, "id": index} for index, segment in enumerate(raw_segments)]
         report(22, f"자막 {len(raw_segments):,}개 구간을 확인했습니다.")
-        agents = GeminiAgents(provider=llm_provider)
+        agents = GeminiAgents(provider=llm_provider, server_access_token=server_access_token)
         provider_label = {"gemini": "Gemini", "deepseek": "DeepSeek"}.get(llm_provider, llm_provider)
         cleaned_result = (
             agents.clean_transcript(raw_segments)
@@ -985,10 +980,6 @@ class LiveEditPipeline:
             raise LiveEditPipelineError("편집할 하이라이트 구간을 선택하지 못했습니다.")
 
         report(88, f"최종 하이라이트 {len(clips):,}개 구간을 선택했습니다.")
-        (output_dir / "raw_transcript.json").write_text(json.dumps({"segments": raw_segments}, ensure_ascii=False, indent=2), encoding="utf-8")
-        (output_dir / "cleaned_transcript.json").write_text(json.dumps(cleaned_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        (output_dir / "scored_clusters.json").write_text(json.dumps(scored, ensure_ascii=False, indent=2), encoding="utf-8")
         generated_subtitles = output_dir / "subtitles.srt"
         subtitle_count = write_selected_subtitles(
             cleaned_segments,
@@ -1017,7 +1008,14 @@ class LiveEditPipeline:
             "selected_segment_ids": recommended_segment_ids,
             "clips": clips,
         }
-        (output_dir / "edit_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.store.save_analysis(
+            job_id,
+            plan=plan,
+            raw_transcript={"segments": raw_segments},
+            cleaned_transcript=cleaned_result,
+            summary=summary,
+            candidates=scored,
+        )
 
         base_result = {
             "job_id": job_id,
@@ -1027,11 +1025,7 @@ class LiveEditPipeline:
             "source_video_path": str(source),
             "subtitle_path": str(subtitle),
             "transcription_source": transcription_source,
-            "raw_transcript_path": str((output_dir / "raw_transcript.json").resolve()),
-            "cleaned_transcript_path": str((output_dir / "cleaned_transcript.json").resolve()),
-            "summary_path": str((output_dir / "summary.json").resolve()),
-            "score_path": str((output_dir / "scored_clusters.json").resolve()),
-            "edit_plan_path": str((output_dir / "edit_plan.json").resolve()),
+            "local_database_path": str(self.store.path.resolve()),
             "generated_subtitles_path": str(generated_subtitles.resolve()),
             "subtitle_count": subtitle_count,
             "subtitles_burned_in": False,
@@ -1045,6 +1039,8 @@ class LiveEditPipeline:
             "target_seconds": target_seconds,
             "selected_duration_seconds": round(sum(item["end"] - item["start"] for item in clips), 3),
             "summary": summary,
+            "candidates": scored,
+            "recommended_segment_ids": recommended_segment_ids,
             "clips": clips,
             "awaiting_selection": defer_render,
         }
@@ -1075,8 +1071,10 @@ class LiveEditPipeline:
         """Return browser-safe candidates and the current user selection."""
 
         output_dir, plan = self._load_edit_plan(job_id)
-        candidates = plan.get("candidates") or []
+        analysis = self.store.get_analysis(job_id)
+        candidates = plan.get("candidates") or (analysis or {}).get("candidates") or []
         if not candidates:
+            raise LiveEditPipelineError("SQLite에 저장된 후보 구간이 없습니다.")
             score_path = output_dir / "scored_clusters.json"
             try:
                 candidates = json.loads(score_path.read_text(encoding="utf-8"))
@@ -1085,19 +1083,6 @@ class LiveEditPipeline:
         _ensure_candidate_ids(candidates)
 
         selected_ids = [str(value) for value in plan.get("selected_segment_ids") or []]
-        if not selected_ids:
-            # Backward compatibility for plans generated before segment IDs
-            # were persisted: infer selection by overlap with rendered clips.
-            clips = plan.get("clips") or []
-            selected_ids = [
-                str(item["segment_id"])
-                for item in candidates
-                if any(
-                    float(item["start"]) < float(clip["end"])
-                    and float(clip["start"]) < float(item["end"])
-                    for clip in clips
-                )
-            ]
         recommended_ids = [
             str(value)
             for value in plan.get("recommended_segment_ids") or selected_ids
@@ -1124,11 +1109,13 @@ class LiveEditPipeline:
             or set(assigned_ids) != candidate_ids
             or len(assigned_ids) != len(candidate_ids)
         ):
-            summary_path = output_dir / "summary.json"
-            try:
-                saved_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                saved_summary = {}
+            saved_summary = (analysis or {}).get("summary") or {}
+            if not saved_summary:
+                summary_path = output_dir / "summary.json"
+                try:
+                    saved_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    saved_summary = {}
             chapters = _build_candidate_chapters(
                 candidates,
                 saved_summary,
@@ -1226,11 +1213,18 @@ class LiveEditPipeline:
         if not clips:
             raise LiveEditPipelineError("선택한 구간에서 유효한 편집 범위를 만들지 못했습니다.")
 
-        cleaned_path = output_dir / "cleaned_transcript.json"
+        analysis = self.store.get_analysis(job_id)
         try:
-            cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
-            cleaned_segments = cleaned["segments"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            cleaned_segments = (analysis or {})["cleaned_transcript"]["segments"]
+        except (KeyError, TypeError):
+            cleaned_path = output_dir / "cleaned_transcript.json"
+            try:
+                cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
+                cleaned_segments = cleaned["segments"]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise LiveEditPipelineError("정제된 자막 데이터를 읽을 수 없습니다.") from exc
+        exc = None
+        if not isinstance(cleaned_segments, list):
             raise LiveEditPipelineError("정제된 자막 파일을 읽을 수 없습니다.") from exc
 
         report(0, "선택한 구간에 맞춰 자막 시간축을 다시 만드는 중입니다.")
@@ -1295,36 +1289,21 @@ class LiveEditPipeline:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        pending_plan = output_dir / "edit_plan.pending.json"
-        pending_plan.write_text(
-            json.dumps(plan, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(pending_plan, output_dir / "edit_plan.json")
-
-        history_path = output_dir / "segment_revisions.json"
-        try:
-            history = json.loads(history_path.read_text(encoding="utf-8"))
-            if not isinstance(history, list):
-                history = []
-        except (OSError, json.JSONDecodeError):
-            history = []
-        history.append(
-            {
-                "revision": revision,
-                "created_at": plan["updated_at"],
-                "segment_ids": canonical_ids,
-                "selected_duration_seconds": round(
-                    sum(float(item["end"]) - float(item["start"]) for item in clips),
-                    3,
-                ),
-                "feedback": plan["last_feedback"],
-            }
-        )
-        history_path.write_text(
-            json.dumps(history[-100:], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        revision_record = {
+            "revision": revision,
+            "created_at": plan["updated_at"],
+            "segment_ids": canonical_ids,
+            "selected_duration_seconds": round(
+                sum(float(item["end"]) - float(item["start"]) for item in clips),
+                3,
+            ),
+            "feedback": plan["last_feedback"],
+        }
+        if self.store.get_analysis(job_id) is not None:
+            self.store.update_plan(job_id, plan)
+            self.store.append_revision(job_id, revision_record)
+        else:
+            raise LiveEditPipelineError("SQLite에 저장된 편집 작업을 찾을 수 없습니다.")
         report(100, "선택한 구간으로 영상을 다시 만들었습니다.")
         return {
             **self.get_segment_review(job_id),
@@ -1338,6 +1317,10 @@ class LiveEditPipeline:
         if not job_id or Path(job_id).name != job_id:
             raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
         output_dir = self.media_root / "yt-edit" / job_id
+        stored = self.store.get_analysis(job_id)
+        if stored is not None:
+            return output_dir, stored["plan"]
+        raise LiveEditPipelineError("SQLite에 저장된 편집 작업을 찾을 수 없습니다.")
         plan_path = output_dir / "edit_plan.json"
         if not plan_path.exists():
             raise LiveEditPipelineError("편집 계획 파일을 찾을 수 없습니다.")
@@ -1353,6 +1336,10 @@ class LiveEditPipeline:
         """Re-render an existing edit after the user changes its SRT file."""
 
         output_dir = self.media_root / "yt-edit" / job_id
+        stored = self.store.get_analysis(job_id)
+        if stored is not None:
+            return self._rerender_stored_plan(job_id, output_dir, output_dir / "subtitles.srt", stored["plan"])
+        raise LiveEditPipelineError("SQLite에 저장된 편집 작업을 찾을 수 없습니다.")
         plan_path = output_dir / "edit_plan.json"
         subtitles = output_dir / "subtitles.srt"
         if not plan_path.exists() or not subtitles.exists():
@@ -1394,6 +1381,46 @@ class LiveEditPipeline:
             encoding="utf-8",
         )
         os.replace(pending_plan, plan_path)
+        return {
+            "job_id": job_id,
+            "rendered_video_path": str(output.resolve()),
+            "generated_subtitles_path": str(subtitles.resolve()),
+            "render_mode": render_mode,
+            "rendered_video_url": f"/api/youtube/edit/{job_id}/media/rendered",
+            "revision": revision,
+        }
+
+    def _rerender_stored_plan(
+        self, job_id: str, output_dir: Path, subtitles: Path, plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not subtitles.exists():
+            raise LiveEditPipelineError("자막 파일을 찾을 수 없습니다.")
+        source = Path(str(plan.get("source_video_path", "")))
+        if not source.is_absolute():
+            source = (Path.cwd() / source).resolve()
+        if not source.exists():
+            raise LiveEditPipelineError("원본 영상을 찾을 수 없습니다.")
+
+        clips = plan.get("clips") or []
+        render_mode = str(plan.get("render_mode", "preview"))
+        font_name = str(plan.get("subtitle_font_name", "Malgun Gothic"))
+        font_size = int(plan.get("subtitle_font_size", 18))
+        revision = int(plan.get("revision") or 0) + 1
+        output = output_dir / f"edited-{render_mode}-r{revision}.mp4"
+        if render_mode == "preview":
+            render_preview(source, clips, output, subtitles, font_name, font_size)
+        elif render_mode == "exact":
+            render_exact(source, clips, output, subtitles, font_name, font_size)
+        else:
+            raise LiveEditPipelineError("올바르지 않은 렌더링 방식입니다.")
+        plan.update(
+            {
+                "revision": revision,
+                "rendered_filename": output.name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self.store.update_plan(job_id, plan)
         return {
             "job_id": job_id,
             "rendered_video_path": str(output.resolve()),

@@ -4,17 +4,13 @@ import asyncio
 import json
 import os
 import re
-import shutil
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from app.config import get_media_root
-
-try:
-    from yt_dlp import YoutubeDL
-except ImportError:  # pragma: no cover - exercised only when dependency is missing
-    YoutubeDL = None
+from app.services.toolchain import ToolchainError, ffmpeg
+from app.services.ytdlp_binary import YoutubeDL
 
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
@@ -47,7 +43,7 @@ YTDLP_DRM_WARNING = (
 YTDLP_STREAM_403_WARNING = (
     "YouTube metadata was readable, but the video stream returned HTTP 403. "
     "This is usually a player-client or PO Token restriction; use the web_embedded "
-    "client and keep yt-dlp[default] with Node/EJS installed."
+    "client and keep the bundled yt-dlp binary with Node/EJS installed."
 )
 
 
@@ -86,9 +82,6 @@ class YouTubeImporter:
         cached = self._find_complete_cached_import(url, job_id)
         if cached is not None:
             return cached
-        if YoutubeDL is None:
-            raise YouTubeImportError("yt-dlp is not installed.")
-
         video_id = self._video_id_from_url(url)
         # A video ID is stable across edit jobs. Keeping newly imported assets
         # here makes later edit requests reuse both the source and its VTT.
@@ -333,7 +326,11 @@ class YouTubeImporter:
             return downloader.extract_info(url, download=True)
 
     def _has_ffmpeg(self) -> bool:
-        return shutil.which("ffmpeg") is not None
+        try:
+            ffmpeg()
+        except ToolchainError:
+            return False
+        return True
 
     def _is_subtitle_rate_limit_error(self, exc: Exception) -> bool:
         message = str(exc)
@@ -369,25 +366,6 @@ class YouTubeImporter:
         warnings: list[str],
     ) -> Path:
         info_path = job_dir / f"{info.get('id') or job_dir.name}.info.json"
-        work_dir = self.media_root / "yt-edit" / job_id
-        work_dir.mkdir(parents=True, exist_ok=True)
-        import_record = {
-            "job_id": job_id,
-            "source_url": url,
-            "title": info.get("title"),
-            "channel": info.get("channel") or info.get("uploader"),
-            "duration": info.get("duration"),
-            "webpage_url": info.get("webpage_url"),
-            "description": info.get("description"),
-            "chapters": info.get("chapters") or [],
-            "video_path": relative_to_cwd(video_file) if video_file else None,
-            "subtitle_files": [relative_to_cwd(path) for path in subtitle_files],
-            "warnings": warnings,
-        }
-        (work_dir / "import.json").write_text(
-            json.dumps(import_record, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
         return info_path
 
     def _find_video_file(self, job_dir: Path, info: dict) -> Path | None:

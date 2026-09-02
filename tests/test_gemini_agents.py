@@ -5,6 +5,7 @@ from app.services.gemini_agents import GeminiAgents, _compact_timed_section_summ
 
 def test_clean_transcript_sends_id_and_text_only_and_applies_only_changes(monkeypatch, tmp_path):
     monkeypatch.setenv("GEMINI_CACHE_DIR", str(tmp_path / "gemini-cache"))
+    monkeypatch.setenv("AVE_SERVER_URL", "https://ave-server.example.test")
     agent = GeminiAgents(api_key="test-key")
     calls = []
 
@@ -29,6 +30,7 @@ def test_clean_transcript_sends_id_and_text_only_and_applies_only_changes(monkey
 
 def test_compress_transcript_requests_id_bounded_chapters_and_boundary_review(monkeypatch, tmp_path):
     monkeypatch.setenv("GEMINI_CACHE_DIR", str(tmp_path / "gemini-cache"))
+    monkeypatch.setenv("AVE_SERVER_URL", "https://ave-server.example.test")
     agent = GeminiAgents(api_key="test-key")
     calls = []
 

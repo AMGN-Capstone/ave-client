@@ -5,23 +5,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-class YouTubeImportRequest(BaseModel):
-    url: str = Field(..., min_length=1)
-
-
-class YouTubeImportResponse(BaseModel):
-    job_id: str
-    video_id: str | None = None
-    transcript_id: str | None = None
-    source_url: str
-    title: str | None = None
-    duration: int | None = None
-    video_path: str | None = None
-    subtitle_files: list[str]
-    metadata_path: str
-    warnings: list[str] = Field(default_factory=list)
-
-
 class AuthUserResponse(BaseModel):
     id: str
     email: str | None = None

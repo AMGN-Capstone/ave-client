@@ -10,6 +10,7 @@ from app.services.live_edit_pipeline import (
     score_chat_density,
     write_selected_subtitles,
 )
+from app.services.local_job_store import LocalJobStore
 
 
 def _write_saved_review_job(tmp_path, job_id="review-job"):
@@ -82,6 +83,17 @@ def _write_saved_review_job(tmp_path, job_id="review-job"):
     )
     (output_dir / "subtitles.srt").write_text("기존 자막", encoding="utf-8")
     (output_dir / "edited-preview.mp4").write_bytes(b"old-render")
+    store = LocalJobStore(tmp_path)
+    store.save_analysis(
+        job_id,
+        plan=plan,
+        raw_transcript={"segments": []},
+        cleaned_transcript=json.loads((output_dir / "cleaned_transcript.json").read_text(encoding="utf-8")),
+        summary={},
+        candidates=candidates,
+    )
+    (output_dir / "edit_plan.json").unlink()
+    (output_dir / "cleaned_transcript.json").unlink()
     return output_dir, plan
 
 
@@ -192,7 +204,7 @@ def test_preview_reencodes_each_clip_from_an_accurate_seek(tmp_path, monkeypatch
     source.write_bytes(b"source")
     commands = []
     progress = []
-    monkeypatch.setattr("app.services.live_edit_pipeline.shutil.which", lambda _name: "ffmpeg")
+    monkeypatch.setattr("app.services.live_edit_pipeline.get_ffmpeg", lambda: "ffmpeg.exe")
     monkeypatch.setattr("app.services.live_edit_pipeline._run_ffmpeg", commands.append)
     monkeypatch.setattr("app.services.live_edit_pipeline.shutil.copyfile", lambda _source, _output: None)
 
@@ -278,10 +290,7 @@ def test_segment_review_rebuilds_malformed_stored_chapters(tmp_path):
             "segment_ids": ["segment-a", "segment-b", "segment-c"],
         },
     ]
-    (output_dir / "edit_plan.json").write_text(
-        json.dumps(plan, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    LocalJobStore(tmp_path).update_plan("review-job", plan)
 
     result = LiveEditPipeline(tmp_path).get_segment_review("review-job")
 
@@ -490,7 +499,7 @@ def test_rerender_from_selection_uses_canonical_times_and_rebuilds_subtitles(
     assert "첫 번째 후보" in captured["subtitles"]
     assert "세 번째 후보" in captured["subtitles"]
     assert "제외할 후보" not in captured["subtitles"]
-    saved_plan = json.loads((output_dir / "edit_plan.json").read_text(encoding="utf-8"))
+    saved_plan = LocalJobStore(tmp_path).get_analysis("review-job")["plan"]
     assert saved_plan["selected_segment_ids"] == ["segment-a", "segment-c"]
     assert saved_plan["last_feedback"] == "첫 구간과 결론을 유지"
     assert saved_plan["revision"] == 1
@@ -520,6 +529,6 @@ def test_rerender_rejects_unknown_segment_without_overwriting_existing_files(
         raise AssertionError("unknown segment must be rejected")
 
     assert called is False
-    assert json.loads((output_dir / "edit_plan.json").read_text(encoding="utf-8")) == original_plan
+    assert LocalJobStore(tmp_path).get_analysis("review-job")["plan"] == original_plan
     assert (output_dir / "subtitles.srt").read_text(encoding="utf-8") == "기존 자막"
     assert (output_dir / "edited-preview.mp4").read_bytes() == b"old-render"

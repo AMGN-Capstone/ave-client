@@ -89,9 +89,7 @@ def test_import_retries_without_subtitles_when_youtube_rate_limits_subtitles(
         "The video was imported without subtitles."
     ]
 
-    import_record = tmp_path / "yt-edit" / result["job_id"] / "import.json"
-    metadata = json.loads(import_record.read_text(encoding="utf-8"))
-    assert metadata["warnings"] == result["warnings"]
+    assert not (tmp_path / "yt-edit" / result["job_id"] / "import.json").exists()
 
 
 class SingleFileYoutubeDL:
@@ -135,9 +133,7 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
         "quality may be lower."
     ]
 
-    import_record = tmp_path / "yt-edit" / result["job_id"] / "import.json"
-    metadata = json.loads(import_record.read_text(encoding="utf-8"))
-    assert metadata["warnings"] == result["warnings"]
+    assert not (tmp_path / "yt-edit" / result["job_id"] / "import.json").exists()
 
 
 def test_import_record_does_not_modify_ytdlp_info_json(tmp_path):
@@ -160,8 +156,7 @@ def test_import_record_does_not_modify_ytdlp_info_json(tmp_path):
 
     assert returned_path == info_path
     assert json.loads(info_path.read_text(encoding="utf-8")) == source_info
-    import_record = json.loads((tmp_path / "yt-edit" / "edit-job" / "import.json").read_text(encoding="utf-8"))
-    assert import_record["warnings"] == ["import warning"]
+    assert not (tmp_path / "yt-edit" / "edit-job" / "import.json").exists()
 
 
 class ForbiddenThenFallbackYoutubeDL(SingleFileYoutubeDL):

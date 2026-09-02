@@ -15,6 +15,8 @@ from typing import Any
 import requests
 
 from app.services.llm_gateway import LLMGateway, LLMGatewayError
+from app.services.local_job_store import LocalJobStore
+from app.config import get_database_root
 
 
 class GeminiAgentError(RuntimeError):
@@ -187,24 +189,17 @@ def _compact_timed_section_summaries(
 class GeminiAgents:
     """Small JSON-only agents with retries and strict local validation."""
 
-    def __init__(self, *, provider: str = "gemini", api_key: str | None = None, model: str | None = None, timeout: float = 120.0):
+    def __init__(self, *, provider: str = "gemini", api_key: str | None = None, model: str | None = None, timeout: float = 120.0, server_access_token: str | None = None):
         self.provider = provider.lower().strip()
         try:
-            self.gateway = LLMGateway(self.provider, api_key=api_key, model=model, timeout=timeout)
+            self.gateway = LLMGateway(self.provider, api_key=api_key, model=model, timeout=timeout, server_access_token=server_access_token)
         except LLMGatewayError as exc:
             raise GeminiAgentError(str(exc)) from exc
-        self.api_key = self.gateway.api_key
+        self.api_key = None
         self.model = self.gateway.model
         self.max_input_chars = self.gateway.max_input_chars
         self.timeout = timeout
-        provider_cache_env = f"LLM_{self.provider.upper()}_CACHE_DIR"
-        legacy_gemini_cache = os.getenv("GEMINI_CACHE_DIR") if self.provider == "gemini" else None
-        self.cache_dir = Path(
-            os.getenv(provider_cache_env)
-            or legacy_gemini_cache
-            or f"media/llm-{self.provider}-cache"
-        ).resolve()
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.local_store = LocalJobStore(get_database_root())
         self.min_request_interval = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "2.0"))
         self._last_request_at = 0.0
 
@@ -229,12 +224,9 @@ class GeminiAgents:
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
-        cache_path = self.cache_dir / f"{cache_key}.json"
-        if cache_path.exists():
-            try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                cache_path.unlink(missing_ok=True)
+        cached = self.local_store.get_llm_cache(cache_key)
+        if cached is not None:
+            return cached
         last_error: Exception | None = None
         request_prompt = prompt
         for attempt in range(retries):
@@ -246,10 +238,7 @@ class GeminiAgents:
                 raw = self.gateway.request_json(system, request_prompt, response_schema=response_schema)
                 try:
                     parsed = _parse_json(raw)
-                    cache_path.write_text(
-                        json.dumps(parsed, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+                    self.local_store.save_llm_cache(cache_key, parsed)
                     return parsed
                 except json.JSONDecodeError as exc:
                     last_error = exc

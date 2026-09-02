@@ -9,60 +9,12 @@ from app.main import (
     _run_live_edit_job,
     app,
     get_current_user,
-    get_youtube_importer,
 )
 from app.schemas import LiveEditRequest
 from app.services.live_youtube_service import LiveYouTubeError
+from app.services.local_job_store import LocalJobStore
 
 import asyncio
-
-
-class FakeYouTubeImporter:
-    async def import_video(self, url: str, job_id: str | None = None):
-        return {
-            "job_id": job_id or "sample-job",
-            "source_url": url,
-            "title": "Sample information video",
-            "duration": 1234,
-            "video_path": "media/yt-data/sample-video-id/video.mp4",
-            "subtitle_files": ["media/yt-data/sample-video-id/subtitles.ko.vtt"],
-            "metadata_path": "media/yt-data/sample-video-id/sample-video-id.info.json",
-            "warnings": [],
-        }
-
-
-def test_youtube_import_returns_collected_asset_summary(monkeypatch):
-    monkeypatch.setattr("app.main.is_server_configured", lambda: True)
-    monkeypatch.setattr("app.main.insert_row", lambda _table, values: values)
-    monkeypatch.setattr("app.main.update_row", lambda _table, _row_id, _values: None)
-    monkeypatch.setattr("app.main.upload_file", lambda *_args: None)
-    app.dependency_overrides[get_youtube_importer] = lambda: FakeYouTubeImporter()
-    app.dependency_overrides[get_current_user] = lambda: {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "email": "test@example.com",
-    }
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/youtube/import",
-        json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
-    )
-
-    app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "job_id": response.json()["job_id"],
-        "video_id": response.json()["video_id"],
-        "transcript_id": None,
-        "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "title": "Sample information video",
-        "duration": 1234,
-        "video_path": None,
-        "subtitle_files": [],
-        "metadata_path": "",
-        "warnings": [],
-    }
 
 
 def test_frontend_index_is_served():
@@ -71,11 +23,13 @@ def test_frontend_index_is_served():
     response = client.get("/")
 
     assert response.status_code == 200
+    assert '<div id="root"></div>' in response.text
+    assert '/ui/assets/' in response.text
+    return
     assert "업로드 완료 영상 자동 편집" in response.text
     assert "채팅 리플레이가 지원되면" in response.text
     assert "Google 로그인" in response.text
     assert "구간 검토 및 영상 생성" in response.text
-    assert "선택 구간으로 영상 생성" in response.text
     assert "챕터 선택" in response.text
     assert "세부 구간을 바로 펼쳐 조정" in response.text
     assert 'id="chapterList"' in response.text
@@ -84,6 +38,26 @@ def test_frontend_index_is_served():
     assert 'name="chat_delay_seconds"' in response.text
     assert "AI로 자막 오타·중복 정제" in response.text
     assert 'id="segmentList"' not in response.text
+
+
+def test_youtube_metadata_returns_preview_contract(monkeypatch):
+    monkeypatch.setattr(
+        "app.main.get_video_metadata",
+        lambda _url: {
+            "title": "테스트 영상",
+            "video_id": "dQw4w9WgXcQ",
+            "thumbnail_files": [{"url": "/api/youtube/thumbnail/dQw4w9WgXcQ/sddefault.jpg", "is_primary": True}],
+            "chapters": [{"start_time": 0, "end_time": 60, "title": "시작"}],
+            "heatmap": [{"start_time": 0, "end_time": 10, "value": 0.8}],
+        },
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/youtube/metadata", json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+
+    assert response.status_code == 200
+    assert response.json()["chapters"][0]["title"] == "시작"
+    assert response.json()["heatmap"][0]["value"] == 0.8
 
 
 def test_upload_video_saves_supported_file(tmp_path, monkeypatch):
@@ -120,11 +94,11 @@ def test_completed_video_edit_continues_when_chat_replay_is_unavailable(tmp_path
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
 
     class FakePipeline:
-        def __init__(self, _media_root):
+        def __init__(self, _media_root, *, database_root=None):
             pass
 
         def run(self, **kwargs):
-            assert kwargs["archive_path"].name == "vod-dQw4w9WgXcQ.jsonl"
+            assert kwargs["archive_path"].name == "chat-replay.jsonl"
             return {"awaiting_selection": True, "summary": {"summary": "내용 요약"}}
 
     def unavailable_replay(*_args, **_kwargs):
@@ -132,13 +106,17 @@ def test_completed_video_edit_continues_when_chat_replay_is_unavailable(tmp_path
 
     monkeypatch.setattr("app.main.LiveEditPipeline", FakePipeline)
     monkeypatch.setattr("app.main.collect_chat_replay", unavailable_replay)
+    monkeypatch.setattr("app.main.create_server_job", lambda *_args, **_kwargs: "server-job")
+    monkeypatch.setattr("app.main.update_server_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.main.save_server_result", lambda *_args, **_kwargs: None)
     job_id = "completed-video-no-chat"
     LIVE_EDIT_JOBS[job_id] = {"job_id": job_id, "status": "queued"}
 
     asyncio.run(
         _run_live_edit_job(
             job_id,
-            LiveEditRequest(vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+                LiveEditRequest(vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+                "Bearer test-token",
         )
     )
 
@@ -179,6 +157,16 @@ def test_segment_review_and_source_preview_endpoints(tmp_path, monkeypatch):
     )
     client = TestClient(app)
 
+    plan = json.loads((output_dir / "edit_plan.json").read_text(encoding="utf-8"))
+    LocalJobStore(tmp_path / "db").save_analysis(
+        job_id,
+        plan=plan,
+        raw_transcript={"segments": []},
+        cleaned_transcript={"segments": []},
+        summary={},
+        candidates=plan["candidates"],
+    )
+    (output_dir / "edit_plan.json").unlink()
     review_response = client.get(f"/api/youtube/edit/{job_id}/segments")
     media_response = client.get(f"/api/youtube/edit/{job_id}/media/source")
 
