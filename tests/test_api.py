@@ -40,6 +40,45 @@ def test_frontend_index_is_served():
     assert 'id="segmentList"' not in response.text
 
 
+def test_react_workflow_retains_the_four_stage_ux_contract():
+    source = (
+        Path(__file__).resolve().parents[1] / "ui" / "src" / "WorkflowApp.tsx"
+    ).read_text(encoding="utf-8")
+
+    for text in (
+        "영상 URL 확인",
+        "영상 분석 및 편집 후보 만들기",
+        "구간 검토 및 영상 생성",
+        "렌더링 결과 및 자막 수정",
+        "Google 로그인",
+        "AI 추천",
+        "자막 저장 및 영상 재생성",
+    ):
+        assert text in source
+
+    for endpoint in (
+        "/api/youtube/metadata",
+        "/api/youtube/edit/start",
+        "/api/youtube/edit/${job.job_id}/segments",
+        "/api/youtube/edit/${job.job_id}/subtitles",
+    ):
+        assert endpoint in source
+
+    for interaction in (
+        "FooterActions",
+        "현재 결과 보기",
+        "controlsLocked",
+        "window.scrollTo",
+        "previewSegment",
+        "onTimeUpdate",
+        "event.currentTarget.pause()",
+        "media/rendered?revision=",
+        "subtitle-content-input",
+        "LegacyEquivalentMetadataView",
+    ):
+        assert interaction in source
+
+
 def test_youtube_metadata_returns_preview_contract(monkeypatch):
     monkeypatch.setattr(
         "app.main.get_video_metadata",

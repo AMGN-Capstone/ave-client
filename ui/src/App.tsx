@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import './index.css'
-import AppView from './AppView'
+import WorkflowApp from './WorkflowApp'
 
 type EditJob = { job_id: string; status: string; progress: number; message: string; error?: string }
 type Segment = { segment_id: string; start: number; end: number; text: string; final_score?: number; selected: boolean }
@@ -127,4 +127,4 @@ function LegacyApp() {
 }
 
 export { LegacyApp }
-export default AppView
+export default WorkflowApp
