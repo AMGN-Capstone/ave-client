@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from app.config import get_media_root
 from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
-from app.services.server_media_service import ServerMediaError, transcribe_uploaded_audio, upload_audio_for_transcription
+from app.services.server_media_service import ServerMediaError, TranscriptionCancelledError, transcribe_uploaded_audio, upload_audio_for_transcription
 from app.services.gemini_agents import GeminiAgents
 from app.services.local_job_store import LocalJobStore
 from app.services.youtube_importer import YouTubeImporter
@@ -29,6 +29,10 @@ EDIT_GENRES = {"ai_news", "stock", "game"}
 
 
 class LiveEditPipelineError(RuntimeError):
+    pass
+
+
+class LiveEditCancelled(LiveEditPipelineError):
     pass
 
 
@@ -865,7 +869,10 @@ class LiveEditPipeline:
         render_mode: str = "preview",
         defer_render: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
+        whisper_progress_callback: Callable[[int, str], None] | None = None,
+        whisper_job_started_callback: Callable[[str], None] | None = None,
         server_access_token: str | None = None,
+        server_job_id: str | None = None,
     ) -> dict[str, Any]:
         def report(progress: int, message: str) -> None:
             if progress_callback:
@@ -914,11 +921,17 @@ class LiveEditPipeline:
                 raw_segments = transcribe_uploaded_audio(
                     uploaded_audio.file_id,
                     server_access_token or "",
+                    client_job_id=job_id,
+                    server_job_id=server_job_id,
                     language=stt_language,
                     initial_prompt=stt_initial_prompt,
                     hotwords=stt_hotwords,
                     speed=stt_speed,
+                    progress_callback=whisper_progress_callback,
+                    job_started_callback=whisper_job_started_callback,
                 )["segments"]
+            except TranscriptionCancelledError as exc:
+                raise LiveEditCancelled(str(exc)) from exc
             except ServerMediaError as exc:
                 raise LiveEditPipelineError(str(exc)) from exc
         if not raw_segments:

@@ -97,6 +97,13 @@ class LocalJobStore:
             ).fetchone()
         return self._load(row["state_json"], {}) if row else None
 
+    def get_active_states(self) -> list[dict[str, Any]]:
+        terminal = {"completed", "failed", "cancelled"}
+        with self._connect() as connection:
+            rows = connection.execute("SELECT state_json FROM edit_jobs ORDER BY updated_at DESC").fetchall()
+        states = [self._load(row["state_json"], {}) for row in rows]
+        return [state for state in states if state.get("job_id") and state.get("status") not in terminal]
+
     def save_analysis(
         self,
         job_id: str,

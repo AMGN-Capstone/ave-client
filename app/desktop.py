@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import socket
 import subprocess
@@ -11,6 +12,7 @@ import webbrowser
 from pathlib import Path
 
 import pystray
+import requests
 import uvicorn
 from PIL import Image, ImageDraw
 
@@ -52,6 +54,18 @@ def _open_logs() -> None:
 
 
 def _stop(icon: pystray.Icon, server: uvicorn.Server) -> None:
+    result = ctypes.windll.user32.MessageBoxW(
+        None,
+        "진행 중인 작업을 취소하고 AVE 클라이언트를 종료할까요?",
+        "AVE 클라이언트 종료",
+        0x24,  # MB_YESNO | MB_ICONQUESTION
+    )
+    if result != 6:  # IDYES
+        return
+    try:
+        requests.post(f"http://{HOST}:{PORT}/api/youtube/edit/cancel-active", timeout=15)
+    except requests.RequestException:
+        logging.getLogger(__name__).warning("종료 전 작업 취소 요청을 전송하지 못했습니다.", exc_info=True)
     server.should_exit = True
     icon.stop()
 

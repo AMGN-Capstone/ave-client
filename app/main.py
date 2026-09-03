@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_ave_server_url, get_database_root, get_media_root
@@ -38,9 +38,10 @@ from app.services.live_youtube_service import (
     get_live_chat,
     get_video_metadata,
 )
-from app.services.live_edit_pipeline import LiveEditPipeline, LiveEditPipelineError
+from app.services.live_edit_pipeline import LiveEditCancelled, LiveEditPipeline, LiveEditPipelineError
 from app.services.local_job_store import LocalJobStore
 from app.services.server_job_service import ServerJobError, create_job as create_server_job, save_result as save_server_result, update_job as update_server_job
+from app.services.server_media_service import ServerMediaError, cancel_uploaded_transcription
 
 
 SUPPORTED_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
@@ -52,6 +53,7 @@ REACT_UI_DIR = STATIC_DIR / "ui"
 app = FastAPI(title="Automatic Video Editor MVP")
 auth_scheme = HTTPBearer(auto_error=False)
 LIVE_EDIT_JOBS: dict[str, dict] = {}
+LIVE_EDIT_ACCESS_TOKENS: dict[str, str] = {}
 EDIT_JOB_LOCKS: dict[str, asyncio.Lock] = {}
 
 if (REACT_UI_DIR / "assets").exists():
@@ -108,6 +110,18 @@ async def react_index():
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="React UI를 빌드하세요: ui에서 npm run build")
     return FileResponse(index_path)
+
+
+@app.get("/ui/favicon.svg")
+async def react_favicon():
+    favicon_path = REACT_UI_DIR / "favicon.svg"
+    if not favicon_path.exists():
+        raise HTTPException(status_code=404, detail="React UI 파비콘을 찾을 수 없습니다.")
+    return FileResponse(
+        favicon_path,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/config", response_model=PublicConfigResponse)
@@ -217,17 +231,53 @@ def _update_live_edit_job(job_id: str, **values) -> None:
         LocalJobStore(get_database_root()).create_or_update_state(job_id, job)
 
 
+def _raise_if_cancel_requested(job_id: str) -> None:
+    if LIVE_EDIT_JOBS.get(job_id, {}).get("status") == "cancel_requested":
+        raise LiveEditCancelled("사용자가 작업을 취소했습니다.")
+
+
+def _cancel_orphaned_local_job(job_id: str, job: dict) -> dict:
+    """재시작 뒤 실행 coroutine이 없는 보존 상태를 UI에 노출하지 않는다."""
+    if job.get("status") in {"completed", "failed", "cancelled", "awaiting_selection"}:
+        return job
+    cancelled = {
+        **job,
+        "status": "cancelled",
+        "progress": 100,
+        "phase": "cancelled",
+        "message": "로컬 클라이언트가 다시 시작되어 이전 작업을 정리했습니다.",
+        "error": None,
+    }
+    LocalJobStore(get_database_root()).create_or_update_state(job_id, cancelled)
+    return cancelled
+
+
 async def _run_live_edit_job(
     job_id: str,
     request: LiveEditRequest,
     server_access_token: str | None = None,
 ) -> None:
     server_job_id: str | None = None
+
+    def report_analysis(progress: int, message: str) -> None:
+        _raise_if_cancel_requested(job_id)
+        _update_live_edit_job(job_id, progress=progress, phase="analysis", message=message)
+
+    def report_transcription(progress: int, message: str) -> None:
+        _raise_if_cancel_requested(job_id)
+        _update_live_edit_job(
+            job_id,
+            progress=progress,
+            transcription_progress=progress,
+            phase="transcription",
+            message=message,
+        )
+
     try:
         _update_live_edit_job(job_id, status="running", progress=3, message="업로드된 영상을 확인하는 중입니다.")
         vod_id = extract_video_id(request.vod_url)
         server_job_id = await asyncio.to_thread(create_server_job, server_access_token or "", client_job_id=job_id, source_id=vod_id, source_url=request.vod_url)
-        LIVE_EDIT_JOBS[job_id]["server_job_id"] = server_job_id
+        _update_live_edit_job(job_id, server_job_id=server_job_id)
         await asyncio.to_thread(update_server_job, server_access_token or "", server_job_id, status="collecting", progress=3)
         archive_path = _chat_archive_path(job_id)
 
@@ -264,8 +314,11 @@ async def _run_live_edit_job(
             render_mode=request.render_mode,
             defer_render=request.interactive_selection,
             server_access_token=server_access_token,
-            progress_callback=lambda progress, message: _update_live_edit_job(
-                job_id, progress=progress, message=message
+            server_job_id=server_job_id,
+            progress_callback=report_analysis,
+            whisper_progress_callback=report_transcription,
+            whisper_job_started_callback=lambda runpod_job_id: _update_live_edit_job(
+                job_id, runpod_job_id=runpod_job_id, phase="transcription", message="Whisper 전사 작업을 시작했습니다."
             ),
         )
         result["vod_video_id"] = vod_id
@@ -291,6 +344,13 @@ async def _run_live_edit_job(
                 message="AI 영상 편집이 완료되었습니다.",
                 result=result,
             )
+    except LiveEditCancelled as exc:
+        if server_job_id:
+            try:
+                await asyncio.to_thread(update_server_job, server_access_token or "", server_job_id, status="cancelled", progress=100, error_message=str(exc))
+            except ServerJobError:
+                pass
+        _update_live_edit_job(job_id, status="cancelled", progress=100, phase="cancelled", message=str(exc), error=None)
     except (LiveYouTubeError, LiveEditPipelineError, ServerJobError) as exc:
         if server_job_id:
             try:
@@ -325,6 +385,7 @@ async def start_live_edit(
         "message": "AI 편집 작업을 준비하는 중입니다.",
     }
     LocalJobStore(get_database_root()).create_or_update_state(job_id, LIVE_EDIT_JOBS[job_id])
+    LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization
     asyncio.create_task(_run_live_edit_job(job_id, request, authorization))
     return LIVE_EDIT_JOBS[job_id]
 
@@ -355,9 +416,132 @@ async def live_edit_status(job_id: str):
     job = LIVE_EDIT_JOBS.get(job_id)
     if job is None:
         job = LocalJobStore(get_database_root()).get_state(job_id)
+        if job is not None:
+            job = _cancel_orphaned_local_job(job_id, job)
     if job is None:
         raise HTTPException(status_code=404, detail="AI 편집 작업을 찾을 수 없습니다.")
     return job
+
+
+@app.get("/api/youtube/edit/{job_id}/events")
+async def live_edit_events(job_id: str):
+    """로컬 작업 상태를 브라우저에 SSE로 전달한다."""
+    async def events():
+        previous = ""
+        while True:
+            job = LIVE_EDIT_JOBS.get(job_id) or LocalJobStore(get_database_root()).get_state(job_id)
+            if job is None:
+                yield 'event: error\ndata: {"detail":"AI 편집 작업을 찾을 수 없습니다."}\n\n'
+                return
+            if job_id not in LIVE_EDIT_JOBS:
+                job = _cancel_orphaned_local_job(job_id, job)
+            payload = json.dumps(job, ensure_ascii=False)
+            if payload != previous:
+                yield f"data: {payload}\n\n"
+                previous = payload
+            if job.get("status") in {"completed", "failed", "cancelled", "awaiting_selection"}:
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/youtube/edit/active")
+async def active_live_edit_jobs():
+    states = LocalJobStore(get_database_root()).get_active_states()
+    active = []
+    for state in states:
+        job_id = state.get("job_id")
+        if state.get("status") == "awaiting_selection":
+            active.append(state)
+        elif isinstance(job_id, str) and job_id in LIVE_EDIT_JOBS:
+            active.append(state)
+        elif isinstance(job_id, str):
+            _cancel_orphaned_local_job(job_id, state)
+    return {"jobs": active}
+
+
+@app.post("/api/youtube/edit/{job_id}/cancel")
+async def cancel_live_edit(job_id: str, authorization: str | None = Header(default=None)):
+    is_live = job_id in LIVE_EDIT_JOBS
+    job = LIVE_EDIT_JOBS.get(job_id) or LocalJobStore(get_database_root()).get_state(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="AI 편집 작업을 찾을 수 없습니다.")
+    if job.get("status") in {"completed", "failed", "cancelled", "awaiting_selection"}:
+        return job
+    runpod_job_id = job.get("runpod_job_id")
+    if isinstance(runpod_job_id, str) and runpod_job_id and not authorization:
+        raise HTTPException(status_code=401, detail="Whisper 작업 취소에는 로그인 토큰이 필요합니다.")
+    job = {
+        **job,
+        "status": "cancel_requested" if is_live else "cancelled",
+        "progress": job.get("progress", 0) if is_live else 100,
+        "phase": "cancelled",
+        "message": "작업 취소를 요청했습니다." if is_live else "실행 중이 아닌 이전 작업을 정리했습니다.",
+        "error": None,
+    }
+    if is_live:
+        LIVE_EDIT_JOBS[job_id] = job
+    LocalJobStore(get_database_root()).create_or_update_state(job_id, job)
+    server_job_id = job.get("server_job_id")
+    access_token = authorization or LIVE_EDIT_ACCESS_TOKENS.get(job_id)
+    if isinstance(server_job_id, str) and server_job_id and access_token:
+        try:
+            await asyncio.to_thread(
+                update_server_job,
+                access_token,
+                server_job_id,
+                status="cancelled",
+                progress=100,
+                error_message="사용자가 작업 취소를 요청했습니다.",
+            )
+        except ServerJobError:
+            # RunPod 취소와 lease 만료 정리는 계속 진행한다.
+            pass
+    if isinstance(runpod_job_id, str) and runpod_job_id:
+        try:
+            await asyncio.to_thread(cancel_uploaded_transcription, runpod_job_id, access_token or "")
+        except ServerMediaError as exc:
+            # 서버가 이미 RunPod 취소를 시작했거나 일시적으로 응답하지 않을 수
+            # 있으므로 로컬 상태는 유지한다. heartbeat 중단 뒤 server lease가 재시도한다.
+            job["message"] = f"취소를 요청했습니다. 서버 확인을 다시 시도합니다: {exc}"
+            if is_live:
+                LIVE_EDIT_JOBS[job_id] = job
+            LocalJobStore(get_database_root()).create_or_update_state(job_id, job)
+    return job
+
+
+@app.post("/api/youtube/edit/cancel-active")
+async def cancel_all_live_edit_jobs():
+    """트레이 종료 시 이 프로세스가 보유한 작업을 모두 중단한다."""
+    cancelled = 0
+    terminal = {"completed", "failed", "cancelled"}
+    jobs = {
+        state["job_id"]: state
+        for state in LocalJobStore(get_database_root()).get_active_states()
+        if isinstance(state.get("job_id"), str)
+    }
+    jobs.update(LIVE_EDIT_JOBS)
+    for job_id, job in jobs.items():
+        if job.get("status") in terminal:
+            continue
+        if job.get("status") == "awaiting_selection":
+            LocalJobStore(get_database_root()).create_or_update_state(
+                job_id,
+                {
+                    **job,
+                    "status": "cancelled",
+                    "progress": 100,
+                    "phase": "cancelled",
+                    "message": "클라이언트 종료로 작업을 취소했습니다.",
+                    "error": None,
+                },
+            )
+            cancelled += 1
+            continue
+        await cancel_live_edit(job_id, LIVE_EDIT_ACCESS_TOKENS.get(job_id))
+        cancelled += 1
+    return {"cancelled": cancelled}
 
 
 async def _run_segment_selection_job(
@@ -369,6 +553,11 @@ async def _run_segment_selection_job(
     async with lock:
         previous_result = dict(LIVE_EDIT_JOBS.get(job_id, {}).get("result") or {})
         server_job_id = LIVE_EDIT_JOBS.get(job_id, {}).get("server_job_id")
+
+        def report_render(progress: int, message: str) -> None:
+            _raise_if_cancel_requested(job_id)
+            _update_live_edit_job(job_id, progress=progress, message=message)
+
         try:
             _update_live_edit_job(
                 job_id,
@@ -383,11 +572,7 @@ async def _run_segment_selection_job(
                 job_id,
                 request.segment_ids,
                 feedback=request.feedback,
-                progress_callback=lambda progress, message: _update_live_edit_job(
-                    job_id,
-                    progress=progress,
-                    message=message,
-                ),
+                progress_callback=report_render,
             )
             merged_result = {
                 **previous_result,
@@ -405,6 +590,21 @@ async def _run_segment_selection_job(
                 message="선택한 구간으로 영상을 다시 만들었습니다.",
                 result=merged_result,
                 error=None,
+            )
+        except LiveEditCancelled as exc:
+            if server_job_id:
+                try:
+                    await asyncio.to_thread(update_server_job, server_access_token or "", server_job_id, status="cancelled", progress=100, error_message=str(exc))
+                except ServerJobError:
+                    pass
+            _update_live_edit_job(
+                job_id,
+                status="cancelled",
+                progress=100,
+                phase="cancelled",
+                message=str(exc),
+                error=None,
+                result=previous_result,
             )
         except LiveEditPipelineError as exc:
             _update_live_edit_job(
@@ -501,6 +701,8 @@ async def update_edit_segments(job_id: str, request: SegmentSelectionRequest, au
         )
     if LIVE_EDIT_JOBS.get(job_id, {}).get("server_job_id") and not authorization:
         raise HTTPException(status_code=401, detail="서버 작업 동기화에는 로그인 토큰이 필요합니다.")
+    if authorization:
+        LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization
     asyncio.create_task(_run_segment_selection_job(job_id, request, authorization))
     return LIVE_EDIT_JOBS[job_id]
 

@@ -29,7 +29,7 @@
 
 ## 현재 전환 상태
 
-Vite 프로젝트는 `ui/`에 있으며 `npm run build` 결과를 `static/ui/`에 생성한다. 로컬 FastAPI 서버는 빌드 결과를 `/`와 `/ui/`에서 제공한다. React UI에는 Google 로그인, YouTube URL 메타데이터(개요·설명·챕터·히트맵), LLM·장르·STT·렌더링 설정, 분석 시작, 작업 상태 polling, 원본·렌더링 결과 로컬 미리보기, 챕터·후보 구간 선택과 AI 추천 복원, 자막 조회·수정·재렌더링이 이전되었다. 상세 대응표는 `UI_PARITY.md`를 참고한다. 전환이 끝난 정적 UI와 `/legacy` 경로는 제거했다.
+Vite 프로젝트는 `ui/`에 있으며 `npm run build` 결과를 `static/ui/`에 생성한다. 로컬 FastAPI 서버는 빌드 결과를 `/`와 `/ui/`에서 제공한다. 명령(시작·선택 렌더링·취소·heartbeat)은 REST로 처리하고, 브라우저의 로컬 편집 진행도는 `GET /api/youtube/edit/{job_id}/events` SSE로 전달한다. 원격 Whisper 진행도는 AVE Server의 `GET /api/stt/transcriptions/{job_id}/events` SSE를 로컬 엔진이 구독해 로컬 SSE로 중계한다. AVE Server와 LLM·RunPod Whisper API 사이 호출은 REST를 유지한다. React UI에는 Google 로그인, YouTube URL 메타데이터(개요·설명·챕터·히트맵), LLM·장르·STT·렌더링 설정, 분석 시작, 원본·렌더링 결과 로컬 미리보기, 챕터·후보 구간 선택과 AI 추천 복원, 자막 조회·수정·재렌더링이 이전되었다. 상세 대응표는 `UI_PARITY.md`를 참고한다. 전환이 끝난 정적 UI와 `/legacy` 경로는 제거했다.
 # 현재 기준 안내
 
 이 문서의 전환 순서는 완료된 분리 작업의 기록이다. 현재 실행, 도구, 서버 연동 범위는 [CURRENT_SCOPE.md](CURRENT_SCOPE.md)를 우선 기준으로 한다.
