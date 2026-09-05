@@ -146,6 +146,27 @@ def cancel_uploaded_transcription(job_id: str, access_token: str) -> None:
         raise ServerMediaError("AVE 서버의 Whisper 전사 작업을 취소하지 못했습니다.") from exc
 
 
+def acknowledge_transcription_result(job_id: str, access_token: str) -> None:
+    try:
+        response = requests.post(f"{_server_url()}/api/stt/transcriptions/{job_id}/ack", headers={"Authorization": access_token}, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ServerMediaError("AVE 서버에 Whisper 전사 결과 확인을 전달하지 못했습니다.") from exc
+
+
+def cancel_pending_uploaded_transcription(client_job_id: str, access_token: str) -> None:
+    """RunPod 작업 ID가 아직 반환되지 않은 전사도 취소 대상으로 등록한다."""
+    try:
+        response = requests.post(
+            f"{_server_url()}/api/stt/transcriptions/client/{client_job_id}/cancel",
+            headers={"Authorization": access_token},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ServerMediaError("AVE 서버에 Whisper 전사 취소 의도를 전달하지 못했습니다.") from exc
+
+
 def _server_url() -> str:
     value = get_ave_server_url()
     if not value.startswith("https://"):

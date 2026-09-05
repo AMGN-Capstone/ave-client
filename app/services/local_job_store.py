@@ -1,4 +1,4 @@
-"""SQLite persistence for local edit job state and analysis results."""
+"""완료된 편집 결과만 보관하는 로컬 SQLite 저장소."""
 
 from __future__ import annotations
 
@@ -9,191 +9,81 @@ from pathlib import Path
 from typing import Any
 
 
-class LocalJobStoreError(RuntimeError):
-    pass
-
-
 class LocalJobStore:
-    """Store processing data separately from yt-dlp and rendered media files."""
+    """실행 상태·전사문·LLM 응답은 저장하지 않는다."""
 
     def __init__(self, database_root: Path):
         self.path = database_root / "ave-client.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        with self._connect() as connection:
+            # 개발용 이전 스키마에는 진행 상태·전사문·LLM 캐시가 포함되어
+            # 있었으므로 호환 마이그레이션 없이 제거한다.
+            connection.execute("DROP TABLE IF EXISTS edit_jobs")
+            connection.execute("DROP TABLE IF EXISTS metadata_material_cache")
+            connection.execute("DROP TABLE IF EXISTS llm_cache")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS completed_edits (
+                    job_id TEXT PRIMARY KEY,
+                    result_json TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                )
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS edit_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    state_json TEXT NOT NULL DEFAULT '{}',
-                    plan_json TEXT,
-                    raw_transcript_json TEXT,
-                    cleaned_transcript_json TEXT,
-                    summary_json TEXT,
-                    candidates_json TEXT,
-                    revisions_json TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS llm_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    value_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-
     @staticmethod
-    def _dump(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _load(value: str | None, default: Any) -> Any:
-        if not value:
-            return default
+    def _load(value: str | None) -> dict[str, Any] | None:
         try:
-            return json.loads(value)
+            parsed = json.loads(value or "")
         except json.JSONDecodeError:
-            return default
-
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def create_or_update_state(self, job_id: str, state: dict[str, Any]) -> None:
-        now = self._now()
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT state_json FROM edit_jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
-            merged = self._load(row["state_json"], {}) if row else {}
-            merged.update(state)
-            connection.execute(
-                """
-                INSERT INTO edit_jobs (job_id, state_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    state_json = excluded.state_json,
-                    updated_at = excluded.updated_at
-                """,
-                (job_id, self._dump(merged), now, now),
-            )
-
-    def get_state(self, job_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT state_json FROM edit_jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
-        return self._load(row["state_json"], {}) if row else None
-
-    def get_active_states(self) -> list[dict[str, Any]]:
-        terminal = {"completed", "failed", "cancelled"}
-        with self._connect() as connection:
-            rows = connection.execute("SELECT state_json FROM edit_jobs ORDER BY updated_at DESC").fetchall()
-        states = [self._load(row["state_json"], {}) for row in rows]
-        return [state for state in states if state.get("job_id") and state.get("status") not in terminal]
-
-    def save_analysis(
-        self,
-        job_id: str,
-        *,
-        plan: dict[str, Any],
-        raw_transcript: dict[str, Any],
-        cleaned_transcript: dict[str, Any],
-        summary: dict[str, Any],
-        candidates: list[dict[str, Any]],
-    ) -> None:
-        now = self._now()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO edit_jobs (
-                    job_id, plan_json, raw_transcript_json, cleaned_transcript_json,
-                    summary_json, candidates_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    plan_json = excluded.plan_json,
-                    raw_transcript_json = excluded.raw_transcript_json,
-                    cleaned_transcript_json = excluded.cleaned_transcript_json,
-                    summary_json = excluded.summary_json,
-                    candidates_json = excluded.candidates_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    job_id,
-                    self._dump(plan),
-                    self._dump(raw_transcript),
-                    self._dump(cleaned_transcript),
-                    self._dump(summary),
-                    self._dump(candidates),
-                    now,
-                    now,
-                ),
-            )
-
-    def get_analysis(self, job_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT * FROM edit_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if row is None or row["plan_json"] is None:
             return None
-        return {
-            "plan": self._load(row["plan_json"], {}),
-            "raw_transcript": self._load(row["raw_transcript_json"], {}),
-            "cleaned_transcript": self._load(row["cleaned_transcript_json"], {}),
-            "summary": self._load(row["summary_json"], {}),
-            "candidates": self._load(row["candidates_json"], []),
-            "revisions": self._load(row["revisions_json"], []),
+        return parsed if isinstance(parsed, dict) else None
+
+    def save_completed(self, job_id: str, result: dict[str, Any]) -> None:
+        completed_at = datetime.now(timezone.utc).isoformat()
+        plan = result.get("analysis_plan") if isinstance(result.get("analysis_plan"), dict) else {}
+        persisted_plan = {
+            key: value for key, value in plan.items()
+            if key in {"genre", "llm_provider", "transcription_source", "target_seconds", "chapters", "selected_segment_ids", "recommended_segment_ids", "clips", "render_mode"}
         }
-
-    def update_plan(self, job_id: str, plan: dict[str, Any]) -> None:
-        now = self._now()
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE edit_jobs SET plan_json = ?, updated_at = ? WHERE job_id = ?",
-                (self._dump(plan), now, job_id),
-            )
-        if cursor.rowcount != 1:
-            raise LocalJobStoreError("저장할 로컬 편집 작업을 찾을 수 없습니다.")
-
-    def append_revision(self, job_id: str, revision: dict[str, Any]) -> None:
-        analysis = self.get_analysis(job_id)
-        if analysis is None:
-            raise LocalJobStoreError("저장할 로컬 편집 작업을 찾을 수 없습니다.")
-        history = analysis["revisions"] if isinstance(analysis["revisions"], list) else []
-        history.append(revision)
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE edit_jobs SET revisions_json = ?, updated_at = ? WHERE job_id = ?",
-                (self._dump(history[-100:]), self._now(), job_id),
-            )
-
-    def get_llm_cache(self, cache_key: str) -> Any | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value_json FROM llm_cache WHERE cache_key = ?", (cache_key,)
-            ).fetchone()
-        return self._load(row["value_json"], None) if row else None
-
-    def save_llm_cache(self, cache_key: str, value: Any) -> None:
+        if isinstance(persisted_plan.get("clips"), list):
+            persisted_plan["clips"] = [
+                {key: item[key] for key in ("segment_id", "start", "end", "llm_score") if key in item}
+                for item in persisted_plan["clips"] if isinstance(item, dict)
+            ]
+        persisted = {
+            "job_id": job_id,
+            "status": "completed",
+            "phase": "completed",
+            "progress": 100,
+            "message": "AI 영상 편집이 완료되었습니다.",
+            "result": {
+                key: value for key, value in result.items()
+                if key in {"rendered_filename", "rendered_video_path", "render_mode", "vod_video_id", "selected_segment_ids", "selected_duration_seconds"}
+            },
+            "analysis_plan": persisted_plan,
+            "completed_at": completed_at,
+        }
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO llm_cache (cache_key, value_json, updated_at)
+                INSERT INTO completed_edits (job_id, result_json, completed_at)
                 VALUES (?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    value_json = excluded.value_json,
-                    updated_at = excluded.updated_at
+                ON CONFLICT(job_id) DO UPDATE SET
+                    result_json = excluded.result_json,
+                    completed_at = excluded.completed_at
                 """,
-                (cache_key, self._dump(value), self._now()),
+                (job_id, json.dumps(persisted, ensure_ascii=False, separators=(",", ":")), completed_at),
             )
+
+    def get_completed(self, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM completed_edits WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return self._load(row["result_json"]) if row else None

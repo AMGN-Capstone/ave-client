@@ -2,37 +2,24 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
-from threading import Lock
+from typing import Callable
 from pathlib import Path
-from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from app.config import get_media_root
 from app.services.ytdlp_binary import YoutubeDL
+from app.services.youtube_importer import YouTubeImporter, YouTubeImportError
 
 
-YOUTUBE_API_ROOT = "https://www.googleapis.com/youtube/v3"
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 THUMBNAIL_FILENAMES = {"sddefault.jpg", "sd1.jpg", "sd2.jpg", "sd3.jpg"}
 
 
 class LiveYouTubeError(RuntimeError):
     pass
-
-
-_CHAT_ARCHIVE_LOCK = Lock()
-
-
-def _chat_archive_path(live_chat_id: str) -> Path:
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id.removeprefix("vod-"))
-    return get_media_root() / "yt-edit" / safe_id / "chat-replay.jsonl"
-
-
-def _chat_session_path(live_chat_id: str) -> Path:
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", live_chat_id.removeprefix("vod-"))
-    return get_media_root() / "yt-edit" / safe_id / "chat-session.json"
 
 
 def _download_thumbnail_list(
@@ -105,77 +92,6 @@ def _cached_thumbnail_files(output_dir: Path, video_id: str, main_thumbnail: str
     return files
 
 
-def _save_chat_messages(live_chat_id: str, messages: list[dict]) -> Path:
-    """Append newly received chat messages to a UTF-8 JSONL archive."""
-
-    archive_path = _chat_archive_path(live_chat_id)
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with _CHAT_ARCHIVE_LOCK:
-        known_keys: set[str] = set()
-        if archive_path.exists():
-            with archive_path.open("r", encoding="utf-8") as archive_file:
-                for line in archive_file:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    record_key = str(record.get("id") or "")
-                    known_keys.add(record_key)
-
-        with archive_path.open("a", encoding="utf-8") as archive_file:
-            for message in messages:
-                record = {
-                    "id": message.get("id"),
-                    "time": message.get("published_at"),
-                    "message": message.get("display_message"),
-                    "type": message.get("type"),
-                    "super_chat": message.get("super_chat"),
-                }
-                record_key = str(record.get("id") or "")
-                if not record_key:
-                    record_key = f"{record['time']}|{record['type']}|{record['message']}"
-                if record_key in known_keys:
-                    continue
-                archive_file.write(
-                    json.dumps(record, ensure_ascii=False)
-                    + "\n"
-                )
-                known_keys.add(record_key)
-
-    return archive_path
-
-
-def _save_replay_messages(archive_key: str, messages: list[dict]) -> Path:
-    """Append normalized yt-dlp replay records to the JSONL archive."""
-
-    archive_path = _chat_archive_path(archive_key)
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    with _CHAT_ARCHIVE_LOCK:
-        known_ids: set[str] = set()
-        if archive_path.exists():
-            with archive_path.open("r", encoding="utf-8") as archive_file:
-                for line in archive_file:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("id"):
-                        known_ids.add(str(record["id"]))
-
-        with archive_path.open("a", encoding="utf-8") as archive_file:
-            for message in messages:
-                message_id = str(message.get("id") or "")
-                if message_id and message_id in known_ids:
-                    continue
-                archive_file.write(
-                    json.dumps(message, ensure_ascii=False) + "\n"
-                )
-                if message_id:
-                    known_ids.add(message_id)
-    return archive_path
-
-
 def _chat_text(value) -> str:
     if isinstance(value, str):
         return value
@@ -210,6 +126,7 @@ def _normalize_ytdlp_replay_action(action: dict) -> list[dict]:
         message = _chat_text(renderer.get("message")) or _chat_text(renderer.get("headerSubtext"))
         messages.append({
             "id": renderer.get("id"),
+            "author": _chat_text(renderer.get("authorName")) or None,
             "elapsed_seconds": elapsed_seconds,
             "message": message,
             "type": renderer_name,
@@ -218,220 +135,136 @@ def _normalize_ytdlp_replay_action(action: dict) -> list[dict]:
     return messages
 
 
-def collect_chat_replay(video_id: str, archive_key: str) -> dict:
-    """Download and normalize an archived live-chat replay with yt-dlp."""
+def _vtt_timestamp_seconds(value: str) -> float:
+    """Convert a WebVTT timestamp to seconds; malformed values sort last."""
 
-    output_dir = get_media_root() / "yt-data" / video_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-    options = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "subtitleslangs": ["live_chat"],
-        "subtitlesformat": "json",
-        "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
     try:
-        with YoutubeDL(options) as downloader:
-            downloader.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-    except Exception as exc:
-        raise LiveYouTubeError(f"yt-dlp 채팅 리플레이 수집에 실패했습니다: {exc}") from exc
+        hours, minutes, seconds = value.replace(",", ".").split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return float("inf")
 
-    raw_files = sorted(output_dir.glob("*.live_chat.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-    if not raw_files:
-        raise LiveYouTubeError("yt-dlp가 채팅 리플레이 파일을 제공하지 않았습니다.")
-    messages: list[dict] = []
-    for line in raw_files[0].read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            messages.extend(_normalize_ytdlp_replay_action(json.loads(line)))
-        except json.JSONDecodeError:
+
+def _clean_vtt_text(text_lines: list[str]) -> str:
+    """Remove WebVTT timing/style markup while preserving readable cue text."""
+
+    text = " ".join(text_lines)
+    text = re.sub(r"<[^>]*>", "", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _parse_vtt_rows(content: str, filename: str) -> list[dict]:
+    rows: list[dict] = []
+    lines = content.replace("\r", "").split("\n")
+    index = 0
+    while index < len(lines):
+        if "-->" not in lines[index]:
+            index += 1
             continue
-    if not messages:
-        raise LiveYouTubeError("yt-dlp 채팅 리플레이에서 시간 정보가 있는 메시지를 읽지 못했습니다.")
-    archive_path = _save_replay_messages(archive_key, messages)
+        start, end = (part.strip().split(" ", 1)[0] for part in lines[index].split("-->", 1))
+        index += 1
+        text_lines = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index])
+            index += 1
+        rows.append({
+            "filename": filename,
+            "start": start,
+            "end": end,
+            "duration_seconds": _vtt_timestamp_seconds(end) - _vtt_timestamp_seconds(start),
+            "text": _clean_vtt_text(text_lines),
+        })
+    return rows
+
+
+def _rolling_caption_rows(rows: list[dict]) -> list[dict]:
+    """Keep completed fragments from YouTube's rolling-caption WebVTT cues.
+
+    Automatic captions commonly contain a long, progressively rewritten cue and
+    a near-zero-length cue with just the newly completed fragment. The latter
+    avoids showing the same growing sentence over and over in the inspector.
+    """
+
+    completed = [row for row in rows if 0 <= row.get("duration_seconds", 1) <= 0.05 and row.get("text")]
+    source = completed or rows
+    cleaned: list[dict] = []
+    previous_text = ""
+    for row in source:
+        text = str(row.get("text") or "")
+        if not text or text == previous_text:
+            continue
+        cleaned.append(row)
+        previous_text = text
+    return cleaned
+
+
+def _write_display_vtt(path: Path, rows: list[dict]) -> None:
+    """2단계에서 확정한 표시용 WebVTT를 이후 단계가 그대로 사용하게 한다."""
+    lines = ["WEBVTT", ""]
+    for row in rows:
+        if not row.get("text"):
+            continue
+        lines.extend([f"{row['start']} --> {row['end']}", str(row["text"]), ""])
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _as_sort_number(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_chat_jsonl_files(output_dir: Path) -> list[Path]:
+    """Use the JSONL extension for yt-dlp's line-delimited chat replay."""
+
+    for json_path in output_dir.glob("*.live_chat.json"):
+        jsonl_path = json_path.with_suffix(".jsonl")
+        if not jsonl_path.exists():
+            json_path.rename(jsonl_path)
+    return sorted(output_dir.glob("*.live_chat.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def _metadata_edit_dir(video_id: str) -> Path:
+    """원본 yt-dlp 산출물에서 파생한 2단계 작업 파일의 고정 위치."""
+    path = get_media_root() / "yt-edit" / f"{video_id}.metadata"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def prepared_metadata_paths(video_id: str) -> dict[str, Path]:
+    """3단계가 재사용할 2단계 파생 자료의 공개 경계다.
+
+    이 함수는 파일을 만들거나 원격에 요청하지 않는다. 호출자는 반환된
+    경로만 읽어야 하며, 자료가 없으면 먼저 2단계를 실행해야 한다.
+    """
+
+    directory = get_media_root() / "yt-edit" / f"{video_id}.metadata"
     return {
-        "source": "yt_dlp_live_chat_replay",
-        "video_id": video_id,
-        "archive_key": archive_key,
-        "message_count": len(messages),
-        "chat_file_path": str(archive_path.resolve()),
+        "directory": directory,
+        "chat_times": directory / f"{video_id}.chat-times.json",
     }
 
 
-def _write_chat_session(live_chat_id: str, values: dict) -> Path:
-    session_path = _chat_session_path(live_chat_id)
-    session_path.parent.mkdir(parents=True, exist_ok=True)
-    with _CHAT_ARCHIVE_LOCK:
-        session_path.write_text(
-            json.dumps(values, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    return session_path
+def load_prepared_transcript(video_id: str, source_kind: str, language: str) -> list[dict]:
+    """선택 언어의 2단계 스크립트만 다시 파싱 없이 읽는다."""
 
-
-def _read_chat_session(live_chat_id: str) -> dict:
-    path = _chat_session_path(live_chat_id)
-    if not path.exists():
-        return {}
+    if source_kind not in {"subtitles", "captions"}:
+        raise LiveYouTubeError("지원하지 않는 스크립트 소스입니다.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,39}", language):
+        raise LiveYouTubeError("선택한 스크립트 언어가 올바르지 않습니다.")
+    parsed_path = prepared_metadata_paths(video_id)["directory"] / f"{video_id}.{language}.{source_kind}-transcript.json"
+    if not parsed_path.is_file():
+        raise LiveYouTubeError(f"2단계에서 준비한 {language} {source_kind} 파싱 파일을 찾지 못했습니다.")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        return None
-
-
-def parse_iso_duration_seconds(value: str | None) -> float | None:
-    """Parse YouTube's simple ISO-8601 video duration without dependencies."""
-
-    if not value or not value.startswith("PT"):
-        return None
-    match = re.fullmatch(
-        r"PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?",
-        value,
-    )
-    if not match:
-        return None
-    return (
-        float(match.group("hours") or 0) * 3600
-        + float(match.group("minutes") or 0) * 60
-        + float(match.group("seconds") or 0)
-    )
-def _message_offset_seconds(
-    published_at: str | None,
-    actual_start_time: str | None,
-    delay_seconds: float,
-) -> float | None:
-    message_time = _parse_datetime(published_at)
-    start_time = _parse_datetime(actual_start_time)
-    if not message_time or not start_time:
-        return None
-    return max(0.0, (message_time - start_time).total_seconds() - delay_seconds)
-
-
-def _load_archived_messages(live_chat_id: str) -> list[dict]:
-    archive_path = _chat_archive_path(live_chat_id)
-    if not archive_path.exists():
-        return []
-    messages: list[dict] = []
-    with archive_path.open("r", encoding="utf-8") as archive_file:
-        for line in archive_file:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            messages.append(message)
-    return messages
-
-
-def analyze_chat_archive(
-    live_chat_id: str,
-    *,
-    actual_start_time: str | None = None,
-    duration_seconds: float | None = None,
-    bucket_seconds: int = 30,
-    delay_seconds: float = 0.0,
-) -> dict:
-    """Convert captured live chat into time buckets and highlight windows."""
-
-    if bucket_seconds < 5 or bucket_seconds > 300:
-        raise LiveYouTubeError("bucket_seconds는 5초에서 300초 사이여야 합니다.")
-
-    session = _read_chat_session(live_chat_id)
-    start_time = actual_start_time or session.get("actual_start_time")
-    messages = _load_archived_messages(live_chat_id)
-    buckets: dict[int, dict] = {}
-
-    for message in messages:
-        offset = message.get("elapsed_seconds")
-        if offset is None:
-            offset = _message_offset_seconds(
-                message.get("time"), start_time, delay_seconds
-            )
-        if offset is None:
-            continue
-        if duration_seconds is not None and offset > duration_seconds:
-            continue
-        bucket_index = int(offset // bucket_seconds)
-        bucket = buckets.setdefault(
-            bucket_index,
-            {
-                "start_seconds": bucket_index * bucket_seconds,
-                "end_seconds": (bucket_index + 1) * bucket_seconds,
-                "message_count": 0,
-                "text_message_count": 0,
-                "event_count": 0,
-                "super_chat_count": 0,
-            },
-        )
-        bucket["message_count"] += 1
-        if message.get("type") == "textMessageEvent":
-            bucket["text_message_count"] += 1
-        else:
-            bucket["event_count"] += 1
-        if message.get("super_chat"):
-            bucket["super_chat_count"] += 1
-
-    ordered = [buckets[index] for index in sorted(buckets)]
-    average = (
-        sum(bucket["message_count"] for bucket in ordered) / len(ordered)
-        if ordered
-        else 0.0
-    )
-    for bucket in ordered:
-        bucket["messages_per_minute"] = round(
-            bucket["message_count"] * 60 / bucket_seconds, 3
-        )
-        bucket["burst_score"] = round(
-            min(1.0, bucket["message_count"] / max(average * 3, 1.0)), 3
-        )
-
-    peak_threshold = max(average * 1.5, 3.0)
-    peak_buckets = [
-        bucket for bucket in ordered if bucket["message_count"] >= peak_threshold
-    ]
-    windows: list[dict] = []
-    padding = max(bucket_seconds, 30)
-    for bucket in peak_buckets:
-        start = max(0.0, bucket["start_seconds"] - padding)
-        end = bucket["end_seconds"] + padding
-        if duration_seconds is not None:
-            end = min(float(duration_seconds), end)
-        if windows and start <= windows[-1]["end_seconds"]:
-            windows[-1]["end_seconds"] = max(windows[-1]["end_seconds"], end)
-            windows[-1]["message_count"] += bucket["message_count"]
-            windows[-1]["burst_score"] = max(
-                windows[-1]["burst_score"], bucket["burst_score"]
-            )
-        else:
-            windows.append(
-                {
-                    "start_seconds": round(start, 3),
-                    "end_seconds": round(end, 3),
-                    "message_count": bucket["message_count"],
-                    "burst_score": bucket["burst_score"],
-                }
-            )
-
-    return {
-        "live_chat_id": live_chat_id,
-        "actual_start_time": start_time,
-        "duration_seconds": duration_seconds,
-        "bucket_seconds": bucket_seconds,
-        "delay_seconds": delay_seconds,
-        "total_messages": len(messages),
-        "average_messages_per_bucket": round(average, 3),
-        "buckets": ordered,
-        "highlight_windows": windows,
-    }
+        payload = json.loads(parsed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LiveYouTubeError("2단계 스크립트 파일을 읽을 수 없습니다.") from exc
+    if isinstance(payload, dict):
+        payload = payload.get("segments")
+    if not isinstance(payload, list):
+        raise LiveYouTubeError("2단계 스크립트 파일 형식이 올바르지 않습니다.")
+    return [row for row in payload if isinstance(row, dict)]
 
 
 def extract_video_id(url: str) -> str:
@@ -455,149 +288,7 @@ def extract_video_id(url: str) -> str:
     return video_id
 
 
-def _youtube_get(path: str, access_token: str, params: dict) -> dict:
-    try:
-        import requests
-    except ImportError as exc:
-        raise LiveYouTubeError(
-            "requests가 설치되어 있지 않습니다. requirements.txt를 설치하세요."
-        ) from exc
-
-    if not access_token.strip():
-        raise LiveYouTubeError(
-            "YouTube OAuth access token이 없습니다. Google 로그인 시 YouTube 읽기 권한을 허용하세요."
-        )
-
-    response = requests.get(
-        f"{YOUTUBE_API_ROOT}/{path}",
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
-    if not response.ok:
-        try:
-            detail = response.json().get("error", {}).get("message", response.text)
-        except ValueError:
-            detail = response.text
-        raise LiveYouTubeError(f"YouTube API 오류 ({response.status_code}): {detail}")
-    return response.json()
-
-
-def get_live_broadcast(access_token: str, video_id: str) -> dict:
-    """Read public live-video metadata without broadcaster-only permissions.
-
-    ``liveBroadcasts.list`` is intended for the broadcaster's channel and
-    returns ``liveStreamingNotEnabled`` for ordinary viewer accounts. The
-    public ``videos.list`` resource exposes the active live chat ID and live
-    metadata without requiring the signed-in user to be a broadcaster.
-    """
-
-    body = _youtube_get(
-        "videos",
-        access_token,
-        {"part": "snippet,liveStreamingDetails,statistics", "id": video_id},
-    )
-    items = body.get("items", [])
-    if not items:
-        raise LiveYouTubeError("YouTube 영상을 찾지 못했습니다.")
-
-    item = items[0]
-    snippet = item.get("snippet", {})
-    live_details = item.get("liveStreamingDetails", {})
-    live_broadcast_content = snippet.get("liveBroadcastContent", "none")
-    is_live_recording = bool(
-        live_details.get("actualStartTime")
-        or live_details.get("actualEndTime")
-        or live_broadcast_content in {"live", "upcoming"}
-    )
-    if not is_live_recording:
-        raise LiveYouTubeError("라이브 방송 다시보기를 찾지 못했습니다.")
-
-    if live_broadcast_content == "live":
-        lifecycle_status = "live"
-    elif live_broadcast_content == "upcoming":
-        lifecycle_status = "upcoming"
-    else:
-        lifecycle_status = "completed"
-    return {
-        "video_id": item.get("id", video_id),
-        "title": snippet.get("title"),
-        "channel_id": snippet.get("channelId"),
-        "published_at": snippet.get("publishedAt"),
-        "actual_start_time": live_details.get("actualStartTime"),
-        "actual_end_time": live_details.get("actualEndTime"),
-        "scheduled_start_time": live_details.get("scheduledStartTime"),
-        "life_cycle_status": lifecycle_status,
-        "concurrent_viewers": live_details.get("concurrentViewers"),
-        "live_chat_id": live_details.get("activeLiveChatId"),
-        "chat_capture_available": bool(live_details.get("activeLiveChatId")),
-        "chat_capture_required_during_live": not bool(live_details.get("activeLiveChatId")),
-        "view_count": item.get("statistics", {}).get("viewCount"),
-    }
-
-
-def get_live_chat(
-    access_token: str,
-    live_chat_id: str,
-    page_token: str | None = None,
-    lifecycle_status: str | None = None,
-    actual_start_time: str | None = None,
-    delay_seconds: float = 0.0,
-) -> dict:
-    if not live_chat_id:
-        raise LiveYouTubeError("라이브 채팅 ID가 없습니다.")
-    params = {
-        "part": "id,snippet,authorDetails",
-        "liveChatId": live_chat_id,
-        "maxResults": 2000,
-    }
-    if page_token:
-        params["pageToken"] = page_token
-
-    body = _youtube_get("liveChat/messages", access_token, params)
-    messages = []
-    for item in body.get("items", []):
-        snippet = item.get("snippet", {})
-        messages.append(
-            {
-                "id": item.get("id"),
-                "type": snippet.get("type"),
-                "published_at": snippet.get("publishedAt"),
-                "display_message": snippet.get("displayMessage"),
-                "super_chat": snippet.get("superChatDetails"),
-            }
-        )
-
-    archive_path = _save_chat_messages(live_chat_id, messages)
-
-    session = _read_chat_session(live_chat_id)
-    session.update(
-        {
-            "live_chat_id": live_chat_id,
-            "actual_start_time": actual_start_time or session.get("actual_start_time"),
-            "last_collected_at": messages[-1].get("published_at") if messages else session.get("last_collected_at"),
-            "chat_file_path": str(archive_path.resolve()),
-        }
-    )
-    _write_chat_session(live_chat_id, session)
-    analysis = analyze_chat_archive(
-        live_chat_id,
-        actual_start_time=session.get("actual_start_time"),
-        delay_seconds=delay_seconds,
-    )
-
-    return {
-        "messages": messages,
-        "next_page_token": body.get("nextPageToken"),
-        "polling_interval_millis": body.get("pollingIntervalMillis", 5000),
-        "offline_at": body.get("offlineAt"),
-        "chat_file_path": str(archive_path.resolve()),
-        "total_messages": analysis["total_messages"],
-        "highlight_windows": analysis["highlight_windows"],
-    }
-
-
-def get_video_metadata(url: str) -> dict:
+def get_video_metadata(url: str, *, refresh: bool = True) -> dict:
     """Read and persist phase-one public metadata through yt-dlp."""
 
     thumbnail_files: list[dict] = []
@@ -606,7 +297,7 @@ def get_video_metadata(url: str) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     info_path = output_dir / f"{video_id}.info.json"
     info: dict | None = None
-    if info_path.exists():
+    if not refresh and info_path.exists():
         try:
             cached_info = json.loads(info_path.read_text(encoding="utf-8"))
             if isinstance(cached_info, dict):
@@ -654,6 +345,9 @@ def get_video_metadata(url: str) -> dict:
 
     if not isinstance(info, dict):
         raise LiveYouTubeError("YouTube 메타데이터 형식이 올바르지 않습니다.")
+    duration = info.get("duration")
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not 600 <= duration < 21_600:
+        raise LiveYouTubeError("10분 이상 6시간 미만 영상만 지원합니다.")
 
     subtitles = info.get("subtitles") or {}
     automatic_captions = info.get("automatic_captions") or {}
@@ -679,6 +373,20 @@ def get_video_metadata(url: str) -> dict:
             # that a replay chat can be requested; the editing job still
             # verifies it before using the messages.
             chat_replay = live_status in {"was_live", "post_live"}
+    def language_options(tracks_by_language: dict, *, prefer_korean: bool = False) -> list[dict]:
+        values = []
+        for language, tracks in tracks_by_language.items():
+            if not isinstance(tracks, list):
+                continue
+            first = next((track for track in tracks if isinstance(track, dict)), {})
+            label = first.get("name") if isinstance(first.get("name"), str) else language
+            values.append({"value": language, "label": label})
+        if prefer_korean:
+            korean = [item for item in values if item["value"] == "ko"]
+            if korean:
+                return korean
+        return values
+
     metadata = {
         "source_url": url,
         "thumbnail": next(
@@ -700,6 +408,10 @@ def get_video_metadata(url: str) -> dict:
         "tags": info.get("tags") or [],
         "subtitles_available": bool(uploaded_subtitles),
         "captions_available": bool(automatic_captions),
+        "subtitle_languages": language_options(uploaded_subtitles),
+        # yt-dlp includes machine-translated caption targets here. In the
+        # Korean client, prefer the Korean track when it is available.
+        "caption_languages": language_options(automatic_captions, prefer_korean=True),
         "chapters": info.get("chapters") or [],
         "heatmap": info.get("heatmap") or [],
         "chat_replay_available": chat_replay,
@@ -712,55 +424,192 @@ def get_video_metadata(url: str) -> dict:
     return {**metadata, "metadata_path": str(info_path.resolve())}
 
 
-def download_live_captions(url: str) -> dict:
-    """Ask yt-dlp for currently exposed live captions without downloading video."""
+def download_metadata_materials(
+    url: str,
+    selections: dict[str, bool],
+    progress_callback: Callable[[int, str], None] | None = None,
+) -> dict:
+    """Download selected optional metadata assets and return small inspection previews."""
 
-    video_id = extract_video_id(url)
-    job_dir = get_media_root() / "yt-data" / video_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    options = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        # Request Korean first. Optional English captions must not block the
-        # rest of the live-metadata response when YouTube rate-limits them.
-        "subtitleslangs": ["ko"],
-        "subtitlesformat": "vtt",
-        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
+    def report(progress: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(progress, message)
 
-    warnings: list[str] = []
-    info: dict = {}
-    try:
-        with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=True)
-    except Exception as exc:
-        message = str(exc)
-        if "429" in message or "Too Many Requests" in message:
-            warnings.append(
-                "YouTube가 자막 요청을 일시적으로 제한했습니다(HTTP 429). "
-                "로컬 Whisper 대체 처리는 지원하지 않습니다. AVE Whisper API를 사용하세요."
-            )
-        else:
-            warnings.append(f"자막을 가져오지 못했습니다: {message}")
+    # 1단계가 남긴 info JSON은 이 단계의 선택 가능 여부와 언어 목록에
+    # 충분하다. 여기서 다시 원격 메타데이터를 조회하면 자료 하나를 받기
+    # 전에 yt-dlp 호출이 한 번 더 발생한다.
+    report(5, "저장된 영상 메타데이터를 불러오는 중입니다.")
+    metadata = get_video_metadata(url, refresh=False)
+    video_id = str(metadata["video_id"])
+    output_dir = get_media_root() / "yt-data" / video_id
+    artifacts: list[dict] = []
+    selected_labels = [label for key, label in (("comments", "댓글"), ("chat", "채팅"), ("subtitles", "자막"), ("captions", "캡션")) if selections.get(key)]
+    completed_count = 0
 
-    subtitle_files = sorted(job_dir.glob("*.vtt"))
-    subtitle_text = ""
-    if subtitle_files:
-        subtitle_text = subtitle_files[0].read_text(
-            encoding="utf-8-sig", errors="replace"
+    def begin_material(label: str) -> None:
+        report(10 + round(completed_count * 85 / max(1, len(selected_labels))), f"{label} 자료를 확인하는 중입니다.")
+
+    def complete_material(label: str) -> None:
+        nonlocal completed_count
+        completed_count += 1
+        report(10 + round(completed_count * 85 / max(1, len(selected_labels))), f"{label} 자료를 준비했습니다.")
+
+    def run_ytdlp(options: dict) -> dict:
+        try:
+            with YoutubeDL(options) as downloader:
+                result = downloader.extract_info(url, download=True)
+        except Exception as exc:
+            raise LiveYouTubeError(f"추가 메타데이터 다운로드에 실패했습니다: {exc}") from exc
+        if not isinstance(result, dict):
+            raise LiveYouTubeError("yt-dlp가 올바른 메타데이터를 반환하지 않았습니다.")
+        return result
+
+    if selections.get("comments"):
+        begin_material("댓글")
+        if not metadata.get("comment_count"):
+            raise LiveYouTubeError("댓글이 없는 영상은 댓글을 다운로드할 수 없습니다.")
+        raw_path = output_dir / f"{video_id}.comments.json"
+        timestamp_path = _metadata_edit_dir(video_id) / f"{video_id}.comments-timestamps.json"
+        comments: list | None = None
+        if raw_path.is_file():
+            try:
+                cached_comments = json.loads(raw_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cached_comments = None
+            if isinstance(cached_comments, list):
+                comments = cached_comments
+        if comments is None:
+            info = run_ytdlp({
+                "skip_download": True,
+                "writeinfojson": True,
+                "writecomments": True,
+                "extractor_args": {"youtube": {"comment_sort": ["top"]}},
+                "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+            })
+            comments = info.get("comments") if isinstance(info.get("comments"), list) else []
+            raw_path.write_text(json.dumps(comments, ensure_ascii=False, indent=2), encoding="utf-8")
+        top_level_comments = [
+            comment
+            for comment in comments
+            if isinstance(comment, dict) and comment.get("parent") in (None, "root")
+        ]
+        top_level_comments.sort(
+            key=lambda comment: (_as_sort_number(comment.get("like_count")), _as_sort_number(comment.get("timestamp"))),
+            reverse=True,
         )
+        timestamp_comments = [
+            comment for comment in top_level_comments
+            if re.search(r"(?:\d{1,2}:)?\d{1,2}:\d{2}", str(comment.get("text") or ""))
+        ]
+        timestamp_path.write_text(json.dumps(timestamp_comments, ensure_ascii=False, indent=2), encoding="utf-8")
+        artifacts.append({"kind": "comments", "label": "댓글", "path": str(raw_path.resolve()), "analysis_path": str(timestamp_path.resolve()), "format": "JSON", "count": len(top_level_comments), "timestamp_count": len(timestamp_comments), "total_count": metadata.get("comment_count"), "preview": top_level_comments})
+        complete_material("댓글")
 
-    return {
-        "title": info.get("title"),
-        "channel": info.get("channel") or info.get("uploader"),
-        "is_live": info.get("is_live"),
-        "duration": info.get("duration"),
-        "subtitle_files": [str(path.resolve()) for path in subtitle_files],
-        "subtitle_text": subtitle_text,
-        "warnings": warnings,
-    }
+    if selections.get("chat"):
+        begin_material("채팅")
+        if not metadata.get("chat_replay_available"):
+            raise LiveYouTubeError("채팅 리플레이를 지원하지 않는 영상입니다.")
+        paths = _live_chat_jsonl_files(output_dir)
+        if not paths:
+            run_ytdlp({
+                "skip_download": True,
+                "writesubtitles": True,
+                "subtitleslangs": ["live_chat"],
+                "subtitlesformat": "json",
+                "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+            })
+            paths = _live_chat_jsonl_files(output_dir)
+        if not paths:
+            raise LiveYouTubeError("yt-dlp가 채팅 리플레이 파일을 제공하지 않았습니다.")
+        path = paths[0]
+        preview = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                preview.extend(_normalize_ytdlp_replay_action(json.loads(line)))
+            except json.JSONDecodeError:
+                continue
+        times_path = _metadata_edit_dir(video_id) / f"{video_id}.chat-times.json"
+        chat_times = [{"elapsed_seconds": item["elapsed_seconds"]} for item in preview if isinstance(item.get("elapsed_seconds"), (int, float))]
+        times_path.write_text(json.dumps(chat_times, ensure_ascii=False, indent=2), encoding="utf-8")
+        artifacts.append({"kind": "chat", "label": "채팅", "path": str(path.resolve()), "analysis_path": str(times_path.resolve()), "format": "JSONL", "count": len(preview), "preview": preview})
+        complete_material("채팅")
+
+    for kind, option, available, label, language_key in (
+        ("subtitles", "writesubtitles", metadata.get("subtitles_available"), "자막", "subtitle_language"),
+        ("captions", "writeautomaticsub", metadata.get("captions_available"), "캡션", "caption_language"),
+    ):
+        if not selections.get(kind):
+            continue
+        begin_material(label)
+        if not available:
+            raise LiveYouTubeError(f"{label}을(를) 지원하지 않는 영상입니다.")
+        language = str(selections.get(language_key) or "")
+        available_languages = metadata.get("subtitle_languages" if kind == "subtitles" else "caption_languages") or []
+        available_values = {item.get("value") for item in available_languages if isinstance(item, dict)}
+        if language not in available_values:
+            raise LiveYouTubeError(f"다운로드할 {label} 언어를 선택하세요.")
+        (output_dir / kind).mkdir(parents=True, exist_ok=True)
+        paths = sorted((output_dir / kind).glob(f"{video_id}.{language}*.vtt"))
+        if paths:
+            paths = [paths[0]]
+        else:
+            options = {
+                "skip_download": True,
+                option: True,
+                "subtitleslangs": [language],
+                "subtitlesformat": "vtt",
+                "outtmpl": str(output_dir / kind / "%(id)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+            }
+            run_ytdlp(options)
+            paths = sorted((output_dir / kind).glob(f"{video_id}.{language}*.vtt"))
+            if not paths:
+                raise LiveYouTubeError(f"yt-dlp가 {label} 파일을 제공하지 않았습니다.")
+        previews = [
+            row
+            for path in paths
+            for row in (
+                _rolling_caption_rows(_parse_vtt_rows(path.read_text(encoding="utf-8", errors="replace"), path.name))
+                if kind == "captions"
+                else _parse_vtt_rows(path.read_text(encoding="utf-8", errors="replace"), path.name)
+            )
+        ]
+        edit_dir = _metadata_edit_dir(video_id)
+        # 업로드 자막은 yt-dlp 원본 VTT를 그대로 표시한다. 캡션만 롤링
+        # 중복을 제거한 VTT를 yt-edit에 별도로 만든다.
+        display_path = paths[0]
+        if kind == "captions":
+            display_path = edit_dir / f"{video_id}.{language}.captions-rolling.vtt"
+            _write_display_vtt(display_path, previews)
+        transcript_segments = [
+            {
+                "start": round(_vtt_timestamp_seconds(str(row["start"])), 3),
+                "end": round(_vtt_timestamp_seconds(str(row["end"])), 3),
+                "text": str(row["text"]),
+            }
+            for row in previews
+            if row.get("text") and _vtt_timestamp_seconds(str(row["end"])) > _vtt_timestamp_seconds(str(row["start"]))
+        ]
+        parsed_path = edit_dir / f"{video_id}.{language}.{kind}-transcript.json"
+        parsed_path.write_text(json.dumps({"segments": transcript_segments}, ensure_ascii=False, indent=2), encoding="utf-8")
+        artifacts.append({"kind": kind, "label": label, "path": str(display_path.resolve()), "parsed_path": str(parsed_path.resolve()), "format": "WebVTT", "count": len(previews), "preview": previews})
+        complete_material(label)
+
+    # 분석 단계는 원격 수집을 하지 않는다. 2단계가 선택된 스크립트와 함께
+    # 원본 영상을 확보해 이후 단계가 yt-data만 읽도록 만든다.
+    if selections.get("subtitles") or selections.get("captions"):
+        try:
+            YouTubeImporter(get_media_root()).prepare_source_video(url, job_id=video_id)
+        except (YouTubeImportError, OSError) as exc:
+            raise LiveYouTubeError(f"분석용 원본 영상을 준비하지 못했습니다: {exc}") from exc
+
+    report(100, "추가 메타데이터 준비를 완료했습니다.")
+    return {"video_id": video_id, "artifacts": artifacts}
+
 
 

@@ -65,7 +65,6 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
                     "end": 4.0,
                     "text": "중요 발언",
                     "llm_score": 0.9,
-                    "chat_density": 2.5,
                     "final_score": 0.8,
                 }
             ],

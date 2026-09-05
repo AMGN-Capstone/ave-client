@@ -25,7 +25,9 @@ def bin_directory() -> Path:
 
 
 def executable(name: str) -> Path:
-    filename = f"{name}.exe" if os.name == "nt" else name
+    # 이 모듈은 Windows 배포 바이너리만 지원한다. 개발 환경이 WSL이어도
+    # 동일한 계약으로 Windows `.exe` 파일을 검증한다.
+    filename = f"{name}.exe"
     path = bin_directory() / filename
     if not path.is_file():
         raise ToolchainError(

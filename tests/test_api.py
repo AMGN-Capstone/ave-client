@@ -1,218 +1,117 @@
-import json
-from io import BytesIO
+import asyncio
 from pathlib import Path
 
-from fastapi.testclient import TestClient
+import pytest
+from fastapi import HTTPException
 
-from app.main import (
-    LIVE_EDIT_JOBS,
-    _run_live_edit_job,
-    app,
-    get_current_user,
-)
-from app.schemas import LiveEditRequest
-from app.services.live_youtube_service import LiveYouTubeError
-from app.services.local_job_store import LocalJobStore
-
-import asyncio
+from app.main import LIVE_EDIT_JOBS, METADATA_MATERIAL_JOBS, app, get_youtube_metadata_material_job, index, start_live_edit, update_edit_segments
+from app.schemas import LiveEditRequest, SegmentSelectionRequest
 
 
 def test_frontend_index_is_served():
-    client = TestClient(app)
-
-    response = client.get("/")
+    response = asyncio.run(index())
 
     assert response.status_code == 200
-    assert '<div id="root"></div>' in response.text
-    assert '/ui/assets/' in response.text
-    return
-    assert "업로드 완료 영상 자동 편집" in response.text
-    assert "채팅 리플레이가 지원되면" in response.text
-    assert "Google 로그인" in response.text
-    assert "구간 검토 및 영상 생성" in response.text
-    assert "챕터 선택" in response.text
-    assert "세부 구간을 바로 펼쳐 조정" in response.text
-    assert 'id="chapterList"' in response.text
-    assert 'id="analysisPhase"' in response.text
-    assert 'id="renderPhase"' in response.text
-    assert 'name="chat_delay_seconds"' in response.text
-    assert "AI로 자막 오타·중복 정제" in response.text
-    assert 'id="segmentList"' not in response.text
+    assert response.path.name == "index.html"
 
 
-def test_react_workflow_retains_the_four_stage_ux_contract():
-    source = (
-        Path(__file__).resolve().parents[1] / "ui" / "src" / "WorkflowApp.tsx"
-    ).read_text(encoding="utf-8")
+def test_workflow_uses_current_endpoints_and_restored_options():
+    source = (Path(__file__).resolve().parents[1] / "ui" / "src" / "WorkflowApp.tsx").read_text(encoding="utf-8")
 
-    for text in (
-        "영상 URL 확인",
-        "영상 분석 및 편집 후보 만들기",
-        "구간 검토 및 영상 생성",
-        "렌더링 결과 및 자막 수정",
-        "Google 로그인",
-        "AI 추천",
-        "자막 저장 및 영상 재생성",
-    ):
-        assert text in source
-
-    for endpoint in (
+    for value in (
         "/api/youtube/metadata",
         "/api/youtube/edit/start",
-        "/api/youtube/edit/${job.job_id}/segments",
-        "/api/youtube/edit/${job.job_id}/subtitles",
+        "transcript_language",
+        "stt_language",
+        "stt_initial_prompt",
+        "stt_hotwords",
+        "stt_speed",
+        "subtitle_font_name",
+        "subtitle_font_size",
     ):
-        assert endpoint in source
-
-    for interaction in (
-        "FooterActions",
-        "현재 결과 보기",
-        "controlsLocked",
-        "window.scrollTo",
-        "previewSegment",
-        "onTimeUpdate",
-        "event.currentTarget.pause()",
-        "media/rendered?revision=",
-        "subtitle-content-input",
-        "LegacyEquivalentMetadataView",
-    ):
-        assert interaction in source
-
-
-def test_youtube_metadata_returns_preview_contract(monkeypatch):
-    monkeypatch.setattr(
-        "app.main.get_video_metadata",
-        lambda _url: {
-            "title": "테스트 영상",
-            "video_id": "dQw4w9WgXcQ",
-            "thumbnail_files": [{"url": "/api/youtube/thumbnail/dQw4w9WgXcQ/sddefault.jpg", "is_primary": True}],
-            "chapters": [{"start_time": 0, "end_time": 60, "title": "시작"}],
-            "heatmap": [{"start_time": 0, "end_time": 10, "value": 0.8}],
-        },
-    )
-    client = TestClient(app)
-
-    response = client.post("/api/youtube/metadata", json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
-
-    assert response.status_code == 200
-    assert response.json()["chapters"][0]["title"] == "시작"
-    assert response.json()["heatmap"][0]["value"] == 0.8
+        assert value in source
+    assert "interactive_selection" not in source
+    assert "/subtitles" not in source
+    assert "subtitle_offset_seconds" not in source
+    assert "scriptSourceOptions" in source
+    options_start = source.index("const scriptSourceOptions")
+    options_end = source.index("function transitionToPhase", options_start)
+    options = source[options_start:options_end]
+    assert options.index("youtube_subtitle") < options.index("youtube_caption") < options.index("whisper_api")
+    assert "review.segments" not in source
+    assert "section.final_score" not in source
+    assert 'className="score-badge"' in source
+    assert "Math.round((Number(body.duration_seconds) || 0) / 4)" in source
+    assert "function transitionToPhase" in source
+    assert "runTransition" not in source
+    assert "function DetailedTime" in source
+    assert "formatMilliseconds" in source
+    assert "addEventListener('seeked'" in source
+    assert 'className="header-separator"' in source
 
 
-def test_upload_video_saves_supported_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
-    client = TestClient(app)
+def test_removed_legacy_routes_are_not_registered():
+    paths = {route.path for route in app.routes}
 
-    response = client.post(
-        "/api/videos/upload",
-        files={"file": ("lesson.mp4", BytesIO(b"fake video bytes"), "video/mp4")},
-    )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["original_filename"] == "lesson.mp4"
-    assert body["stored_filename"].endswith(".mp4")
-    assert body["content_type"] == "video/mp4"
-    assert (tmp_path / "yt-edit" / "uploads" / Path(body["stored_filename"]).stem / body["stored_filename"]).exists()
+    assert "/api/videos/upload" not in paths
+    assert "/api/youtube/live/inspect" not in paths
+    assert "/api/youtube/edit" not in paths
 
 
-def test_upload_video_rejects_unsupported_extension(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
-    client = TestClient(app)
+def test_metadata_material_terminal_status_is_consumed_once():
+    job_id = "metadata-terminal"
+    METADATA_MATERIAL_JOBS[job_id] = {"job_id": job_id, "status": "completed", "result": {"video_id": "dQw4w9WgXcQ"}}
+    response = asyncio.run(get_youtube_metadata_material_job(job_id))
 
-    response = client.post(
-        "/api/videos/upload",
-        files={"file": ("notes.txt", BytesIO(b"not a video"), "text/plain")},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Unsupported video format."
+    assert response["status"] == "completed"
+    assert job_id not in METADATA_MATERIAL_JOBS
+    with pytest.raises(HTTPException, match="찾을 수 없습니다"):
+        asyncio.run(get_youtube_metadata_material_job(job_id))
 
 
-def test_completed_video_edit_continues_when_chat_replay_is_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
+def test_edit_request_defaults_match_workflow_defaults():
+    request = LiveEditRequest(vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
-    class FakePipeline:
-        def __init__(self, _media_root, *, database_root=None):
-            pass
+    assert request.llm_provider == "deepseek"
+    assert request.transcription_source == "youtube_caption"
+    assert request.transcript_language is None
 
-        def run(self, **kwargs):
-            assert kwargs["archive_path"].name == "chat-replay.jsonl"
-            return {"awaiting_selection": True, "summary": {"summary": "내용 요약"}}
 
-    def unavailable_replay(*_args, **_kwargs):
-        raise LiveYouTubeError("채팅 리플레이가 없습니다.")
+def test_selection_api_starts_render_with_only_segment_ids(monkeypatch):
+    job_id = "selection-contract"
+    LIVE_EDIT_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "awaiting_selection",
+        "phase": "selection",
+        "result": {"analysis_plan": {"candidates": [{"segment_id": "chapter-00", "start": 0, "end": 10}]}},
+    }
+    created = []
 
-    monkeypatch.setattr("app.main.LiveEditPipeline", FakePipeline)
-    monkeypatch.setattr("app.main.collect_chat_replay", unavailable_replay)
-    monkeypatch.setattr("app.main.create_server_job", lambda *_args, **_kwargs: "server-job")
-    monkeypatch.setattr("app.main.update_server_job", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("app.main.save_server_result", lambda *_args, **_kwargs: None)
-    job_id = "completed-video-no-chat"
-    LIVE_EDIT_JOBS[job_id] = {"job_id": job_id, "status": "queued"}
+    def no_background_task(coroutine):
+        created.append(coroutine)
+        coroutine.close()
 
-    asyncio.run(
-        _run_live_edit_job(
-            job_id,
-                LiveEditRequest(vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
-                "Bearer test-token",
-        )
+    monkeypatch.setattr("app.main.asyncio.create_task", no_background_task)
+    response = asyncio.run(
+        update_edit_segments(job_id, SegmentSelectionRequest(segment_ids=["chapter-00"]))
     )
 
-    assert LIVE_EDIT_JOBS[job_id]["status"] == "awaiting_selection"
-    assert LIVE_EDIT_JOBS[job_id]["result"]["chat_replay_used"] is False
+    assert response["phase"] == "render"
+    assert len(created) == 1
+    LIVE_EDIT_JOBS.pop(job_id, None)
 
 
-def test_segment_review_and_source_preview_endpoints(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
-    job_id = "segment-api-job"
-    output_dir = tmp_path / "yt-edit" / job_id
-    output_dir.mkdir(parents=True)
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"fake mp4")
-    (output_dir / "edit_plan.json").write_text(
-        json.dumps(
-            {
-                "genre": "game",
-                "target_seconds": 60,
-                "source_video_path": str(source),
-                "render_mode": "preview",
-                "candidates": [
-                    {
-                        "segment_id": "segment-0000",
-                        "start": 5.0,
-                        "end": 15.0,
-                        "text": "결정적 장면",
-                        "final_score": 910,
-                    }
-                ],
-                "recommended_segment_ids": ["segment-0000"],
-                "selected_segment_ids": ["segment-0000"],
-                "clips": [{"start": 4.6, "end": 15.6}],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    client = TestClient(app)
+def test_analysis_start_api_queues_only_memory_job(monkeypatch):
+    created = []
 
-    plan = json.loads((output_dir / "edit_plan.json").read_text(encoding="utf-8"))
-    LocalJobStore(tmp_path / "db").save_analysis(
-        job_id,
-        plan=plan,
-        raw_transcript={"segments": []},
-        cleaned_transcript={"segments": []},
-        summary={},
-        candidates=plan["candidates"],
-    )
-    (output_dir / "edit_plan.json").unlink()
-    review_response = client.get(f"/api/youtube/edit/{job_id}/segments")
-    media_response = client.get(f"/api/youtube/edit/{job_id}/media/source")
+    def no_background_task(coroutine):
+        created.append(coroutine)
+        coroutine.close()
 
-    assert review_response.status_code == 200
-    review = review_response.json()
-    assert review["segments"][0]["selected"] is True
-    assert review["segments"][0]["chapter_id"] == "chapter-00"
-    assert review["chapters"][0]["segment_ids"] == ["segment-0000"]
-    assert media_response.status_code == 200
-    assert media_response.content == b"fake mp4"
+    monkeypatch.setattr("app.main.asyncio.create_task", no_background_task)
+    response = asyncio.run(start_live_edit(LiveEditRequest(vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ"), authorization="Bearer session"))
+
+    assert response["status"] == "queued"
+    assert response["job_id"] in LIVE_EDIT_JOBS
+    assert len(created) == 1
+    LIVE_EDIT_JOBS.pop(response["job_id"], None)

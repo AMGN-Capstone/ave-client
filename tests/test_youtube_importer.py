@@ -24,7 +24,7 @@ def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, m
     )
     monkeypatch.setattr(youtube_importer, "YoutubeDL", None)
 
-    result = YouTubeImporter(tmp_path)._import_video_sync(
+    result = YouTubeImporter(tmp_path).prepare_source_video(
         "https://www.youtube.com/watch?v=abc123", job_id="new-edit-job"
     )
 
@@ -33,6 +33,47 @@ def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, m
     assert result["cache_hit"] is True
     assert Path(result["video_path"]).resolve() == video.resolve()
     assert [Path(path).resolve() for path in result["subtitle_files"]] == [subtitle.resolve()]
+
+
+def test_import_reuses_phase_two_caption_when_downloading_the_source_video(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "yt-data" / "abc123"
+    captions_dir = cache_dir / "captions"
+    captions_dir.mkdir(parents=True)
+    (cache_dir / "abc123.info.json").write_text(
+        json.dumps({"id": "abc123", "title": "Cached metadata", "duration": 60}),
+        encoding="utf-8",
+    )
+    caption = captions_dir / "abc123.ko.vtt"
+    caption.write_text("WEBVTT\n", encoding="utf-8")
+
+    class VideoOnlyYoutubeDL:
+        calls = []
+
+        def __init__(self, options):
+            self.options = options
+            self.job_dir = Path(options["outtmpl"]).parent
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, url, download=True):
+            self.__class__.calls.append(self.options)
+            video = self.job_dir / "abc123.mp4"
+            video.write_bytes(b"video")
+            return {"id": "abc123", "title": "Downloaded video", "duration": 60, "webpage_url": url, "requested_downloads": [{"filepath": str(video)}]}
+
+    monkeypatch.setattr(youtube_importer, "YoutubeDL", VideoOnlyYoutubeDL)
+    monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: True)
+
+    result = YouTubeImporter(tmp_path).prepare_source_video("https://www.youtube.com/watch?v=abc123")
+
+    assert VideoOnlyYoutubeDL.calls[0]["writesubtitles"] is False
+    assert VideoOnlyYoutubeDL.calls[0]["writeautomaticsub"] is False
+    assert VideoOnlyYoutubeDL.calls[0]["writeinfojson"] is False
+    assert [Path(path).resolve() for path in result["subtitle_files"]] == [caption.resolve()]
 
 
 class SubtitleRateLimitedYoutubeDL:
@@ -77,7 +118,7 @@ def test_import_retries_without_subtitles_when_youtube_rate_limits_subtitles(
     monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: True)
     importer = YouTubeImporter(tmp_path)
 
-    result = importer._import_video_sync("https://www.youtube.com/watch?v=abc123")
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert len(SubtitleRateLimitedYoutubeDL.calls) == 2
     assert SubtitleRateLimitedYoutubeDL.calls[0]["writesubtitles"] is True
@@ -123,7 +164,7 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
     monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: False, raising=False)
     importer = YouTubeImporter(tmp_path)
 
-    result = importer._import_video_sync("https://www.youtube.com/watch?v=abc123")
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert SingleFileYoutubeDL.calls[0]["format"] == "best[ext=mp4]/best"
     assert "merge_output_format" not in SingleFileYoutubeDL.calls[0]
@@ -184,7 +225,7 @@ def test_import_retries_with_a_different_player_client_on_403(tmp_path, monkeypa
     monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: False, raising=False)
     importer = YouTubeImporter(tmp_path)
 
-    result = importer._import_video_sync("https://www.youtube.com/watch?v=abc123")
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     clients = [
         options.get("extractor_args", {}).get("youtube", {}).get("player_client", [None])[0]
@@ -220,7 +261,7 @@ def test_import_disables_browser_cookies_after_database_copy_failure(tmp_path, m
     monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: False, raising=False)
     importer = YouTubeImporter(tmp_path)
 
-    result = importer._import_video_sync("https://www.youtube.com/watch?v=abc123")
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert len(CookieDatabaseThenSuccessYoutubeDL.calls) == 2
     assert "cookiesfrombrowser" in CookieDatabaseThenSuccessYoutubeDL.calls[0]
@@ -253,7 +294,7 @@ def test_import_retries_without_browser_cookies_after_403(tmp_path, monkeypatch)
     monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: False, raising=False)
     importer = YouTubeImporter(tmp_path)
 
-    result = importer._import_video_sync("https://www.youtube.com/watch?v=abc123")
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert len(ForbiddenWithCookiesThenSuccessYoutubeDL.calls) == 2
     assert "cookiesfrombrowser" in ForbiddenWithCookiesThenSuccessYoutubeDL.calls[0]

@@ -10,6 +10,14 @@
 
 영상 관련 작업은 모두 로컬에서 처리합니다. `/bin`의 `yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe`를 사용해 영상과 메타데이터를 수집하고, 자막과 분석 보조 데이터를 만들며, 선택 구간을 렌더링합니다.
 
+### 단계별 수집 재사용
+
+`yt-data/{video_id}`에는 yt-dlp가 받은 원본만 둡니다. 메타데이터 JSON, 원본 영상, 전체 댓글 JSON, 전체 채팅 JSONL, 원본 자막·캡션 VTT가 여기에 해당하며 작업 중 수정하지 않습니다.
+
+`yt-edit/{video_id}.metadata`에는 2단계에서 원본을 가공한 파일을 둡니다. 대댓글을 제외한 댓글은 메모리에서만 표시하고, 타임스탬프 댓글은 `comments-timestamps.json`, 채팅 시각은 `chat-times.json`으로 저장합니다. 자동 캡션은 롤링 중복을 제거한 `captions-rolling.vtt`와 파싱 스크립트 파일을 저장하며, 업로드 자막의 파싱 스크립트도 여기에 둡니다. 파싱 스크립트와 Whisper 전사 파일은 모두 `{"segments":[{"start":number,"end":number,"text":string}]}` 형식이다. Whisper 전사와 3·4단계 스크립트·계획·결과는 `yt-edit/{job_id}`에 저장합니다. 3단계는 `prepared_metadata_paths`와 `load_prepared_transcript` 공개 경계로만 이 자료를 읽습니다.
+
+3단계는 이 파일과 이미 받은 원본 영상만 읽으며 yt-dlp 재수집이나 WebVTT 재파싱을 하지 않습니다.
+
 ## 서버 연동
 
 클라이언트는 서버에 인증, LLM, 원격 STT, 작업 이력 동기화를 요청합니다. 서버 URL은 `.env`의 `AVE_SERVER_URL`로 설정합니다. LLM·Whisper의 비밀 값은 클라이언트에 두지 않습니다.
@@ -24,6 +32,6 @@
 
 ## 로컬 SQLite 저장소
 
-`db/ave-client.sqlite3`는 작업 상태, 편집 계획, 전사본, 요약, 후보 점수, 선택 및 재렌더링 이력을 저장합니다. yt-dlp가 수집한 영상·자막·메타데이터·썸네일 캐시와 자막·렌더링 결과는 `media/` 파일로 유지합니다. 기본 경로는 `DB_ROOT` 환경 변수로 변경할 수 있습니다.
+`db/ave-client.sqlite3`는 완료된 결과 영상의 최소 조회 정보만 저장합니다. 진행 상태, 전사본, 스크립트, LLM 응답 및 후보 점수는 저장하지 않습니다. LLM 응답 캐시는 없습니다. 분석 중 스크립트·계획 파일은 `yt-edit/{job_id}`에만 존재하며 취소·실패 시 함께 삭제됩니다.
 
 개발 단계에서는 테스트·개발 실행으로 생성된 `media/` 작업물과 `db/` SQLite DB를 보존하거나 이전 파일 구조와 호환하지 않습니다. 저장 구조가 바뀌면 기존 작업물을 삭제하고 새 작업으로 검증합니다.

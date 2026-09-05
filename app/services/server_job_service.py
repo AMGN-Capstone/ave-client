@@ -21,30 +21,29 @@ def create_job(access_token: str, *, client_job_id: str, source_id: str, source_
     return job_id
 
 
-def update_job(access_token: str, job_id: str, *, status: str, progress: int, error_message: str | None = None) -> None:
-    _request("PATCH", f"/api/analysis-jobs/{job_id}", access_token, {"status": status, "progress": progress, "error_message": error_message})
-
-
 def save_result(access_token: str, job_id: str, result: dict[str, Any], *, selection: dict[str, Any] | None = None) -> None:
-    candidates = result.get("candidates") or []
+    plan = result.get("analysis_plan") if isinstance(result.get("analysis_plan"), dict) else {}
+    candidates = plan.get("candidates") if isinstance(plan.get("candidates"), list) else result.get("candidates") or []
     segments = [
         {
             "segment_index": index,
             "start_ms": int(float(item.get("start", 0)) * 1000),
             "end_ms": max(1, int(float(item.get("end", 0)) * 1000)),
-            "text": str(item.get("text", "")),
+            # 서버 이력에는 원본 전사문을 보내지 않는다.
+            "text": "",
             "script_importance": _score(item.get("llm_score")),
-            "chat_density": _number(item.get("chat_density")),
-            "comment_timestamp_count": _integer(item.get("chat_count")),
+            "comment_timestamp_count": None,
             "heatmap_score": None,
             "average_volume_dbfs": _number(item.get("average_volume_dbfs")),
-            "final_score": _score(item.get("final_score")),
-            "recommended": str(item.get("segment_id")) in set(result.get("recommended_segment_ids") or []),
+            # 현재 선택 근거는 섹션 LLM 점수 하나뿐이다. 서버의 기존
+            # final_score 필드는 별도 보정 점수가 아니라 이 값을 기록한다.
+            "final_score": _score(item.get("llm_score")),
+            "recommended": str(item.get("segment_id")) in set(plan.get("recommended_segment_ids") or result.get("recommended_segment_ids") or []),
         }
         for index, item in enumerate(candidates)
         if float(item.get("end", 0)) > float(item.get("start", 0))
     ]
-    _request("PUT", f"/api/analysis-jobs/{job_id}/result", access_token, {"script": None, "segments": segments, "heatmap": [], "recommendation": {"summary": result.get("summary"), "recommended_segment_ids": result.get("recommended_segment_ids", [])}, "selection": selection or {}})
+    _request("PUT", f"/api/analysis-jobs/{job_id}/result", access_token, {"script": None, "segments": segments, "heatmap": [], "recommendation": {"recommended_segment_ids": plan.get("recommended_segment_ids") or result.get("recommended_segment_ids", [])}, "selection": selection or {}})
 
 
 def _request(method: str, path: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -55,8 +54,18 @@ def _request(method: str, path: str, access_token: str, payload: dict[str, Any])
         response = requests.request(method, f"{base_url}{path}", headers={"Authorization": access_token, "Content-Type": "application/json"}, json=payload, timeout=30)
         response.raise_for_status()
         body = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise ServerJobError("AVE 서버와 작업 이력을 동기화하지 못했습니다.") from exc
+    except requests.RequestException as exc:
+        detail = ""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                detail = str(response.json().get("detail") or "")
+            except (ValueError, AttributeError):
+                detail = response.text.strip()[:500]
+        suffix = f": {detail}" if detail else ""
+        raise ServerJobError(f"AVE 서버와 작업 이력을 동기화하지 못했습니다{suffix}") from exc
+    except ValueError as exc:
+        raise ServerJobError("AVE 서버 응답 형식이 올바르지 않습니다.") from exc
     return body if isinstance(body, dict) else {}
 
 

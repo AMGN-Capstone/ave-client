@@ -15,73 +15,33 @@ class PublicConfigResponse(BaseModel):
     supabase_anon_key: str
 
 
-class UploadVideoResponse(BaseModel):
-    original_filename: str
-    stored_filename: str
-    content_type: str | None = None
-    size_bytes: int
-    path: str
-
-
-class LiveYouTubeRequest(BaseModel):
-    url: str = Field(..., min_length=1)
-
-
 class YouTubeMetadataRequest(BaseModel):
     url: str = Field(..., min_length=1, description="확인할 YouTube 영상 URL")
 
 
-class LiveChatResponse(BaseModel):
-    messages: list[dict] = Field(default_factory=list)
-    next_page_token: str | None = None
-    polling_interval_millis: int = 5000
-    offline_at: str | None = None
-    chat_file_path: str | None = None
-    total_messages: int = 0
-    highlight_windows: list[dict] = Field(default_factory=list)
-
-
-class LiveFinalizeRequest(BaseModel):
-    live_chat_id: str | None = Field(default=None, min_length=1)
-    vod_url: str = Field(..., min_length=1)
-    actual_start_time: str | None = None
-    bucket_seconds: int = Field(default=30, ge=5, le=300)
-    delay_seconds: float = Field(default=0.0, ge=0, le=120)
-
-
-class LiveFinalizeResponse(BaseModel):
-    vod_video_id: str
-    vod_title: str | None = None
-    vod_duration_iso: str | None = None
-    chat_file_path: str | None = None
-    analysis: dict
-    source_video_required: bool = True
-    message: str
+class YouTubeMetadataMaterialsRequest(YouTubeMetadataRequest):
+    comments: bool = False
+    chat: bool = False
+    subtitles: bool = False
+    captions: bool = False
+    subtitle_language: str | None = Field(default=None, max_length=40)
+    caption_language: str | None = Field(default=None, max_length=40)
 
 
 class LiveEditRequest(BaseModel):
     vod_url: str = Field(..., min_length=1, description="이미 업로드된 YouTube 영상 URL")
-    llm_provider: Literal["gemini", "deepseek"] = "gemini"
+    llm_provider: Literal["gemini", "deepseek"] = "deepseek"
     genre: Literal["ai_news", "stock", "game"] = "ai_news"
     target_duration_seconds: int = Field(default=600, ge=60, le=3600)
-    chat_delay_seconds: float = Field(default=0.0, ge=-120, le=120)
-    clean_subtitles: bool = Field(default=False, description="AI 자막 정제 실행 여부")
-    subtitle_offset_seconds: float = Field(default=0.0, ge=-120, le=120)
-    transcription_source: Literal["youtube_caption", "whisper_api"] = "youtube_caption"
+    transcription_source: Literal["youtube_caption", "youtube_subtitle", "whisper_api"] = "youtube_caption"
+    transcript_language: str | None = Field(default=None, min_length=1, max_length=40)
     stt_language: str = Field(default="ko", min_length=1, max_length=20)
     stt_initial_prompt: str | None = Field(default=None, max_length=1_000)
     stt_hotwords: str | None = Field(default=None, max_length=1_000)
-    stt_speed: float = Field(default=1.0, ge=1.0, le=4.0)
+    stt_speed: Literal[1.0, 1.5, 2.0] = 1.0
     subtitle_font_name: str = Field(default="Malgun Gothic", min_length=1, max_length=100)
     subtitle_font_size: int = Field(default=18, ge=8, le=64)
     render_mode: str = Field(default="preview", pattern="^(preview|exact)$")
-    interactive_selection: bool = True
-
-
-class SubtitleUpdateRequest(BaseModel):
-    content: str = Field(default="", max_length=2_000_000)
-
 
 class SegmentSelectionRequest(BaseModel):
     segment_ids: list[str] = Field(..., min_length=1, max_length=500)
-    feedback: str | None = Field(default=None, max_length=2_000)

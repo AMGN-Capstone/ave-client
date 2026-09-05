@@ -77,3 +77,33 @@ def test_cancel_uploaded_transcription_calls_server_cancel(monkeypatch):
 
     assert calls[0][0].endswith("/api/stt/transcriptions/runpod-002/cancel")
     assert calls[0][1]["headers"]["Authorization"] == "Bearer token"
+
+
+def test_acknowledge_transcription_result_calls_server_ack(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server_media_service, "_server_url", lambda: "https://server.example")
+    monkeypatch.setattr(
+        server_media_service.requests,
+        "post",
+        lambda url, **kwargs: calls.append((url, kwargs)) or _Response(),
+    )
+
+    server_media_service.acknowledge_transcription_result("runpod-ack", "Bearer token")
+
+    assert calls[0][0].endswith("/api/stt/transcriptions/runpod-ack/ack")
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer token"
+
+
+def test_cancel_pending_uploaded_transcription_uses_client_job_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server_media_service, "_server_url", lambda: "https://server.example")
+    monkeypatch.setattr(
+        server_media_service.requests,
+        "post",
+        lambda url, **kwargs: calls.append((url, kwargs)) or _Response(),
+    )
+
+    server_media_service.cancel_pending_uploaded_transcription("local-003", "Bearer token")
+
+    assert calls[0][0].endswith("/api/stt/transcriptions/client/local-003/cancel")
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer token"

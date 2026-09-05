@@ -14,7 +14,7 @@ from pathlib import Path
 import pystray
 import requests
 import uvicorn
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 HOST = "127.0.0.1"
@@ -24,9 +24,17 @@ LOG_PATH = PROJECT_ROOT / "client.log"
 
 
 def _create_icon_image() -> Image.Image:
-    image = Image.new("RGBA", (64, 64), "#111827")
+    """웹 파비콘과 동일한 AVE 워드마크를 트레이용 래스터로 만든다."""
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.polygon([(14, 12), (52, 32), (14, 52)], fill="#38bdf8")
+    draw.rounded_rectangle((0, 0, 63, 63), radius=12, fill="#1f2937")
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 30)
+    except OSError:
+        font = ImageFont.load_default()
+    bounds = draw.textbbox((0, 0), "AVE", font=font)
+    draw.text(((64 - (bounds[2] - bounds[0])) / 2, (64 - (bounds[3] - bounds[1])) / 2 - bounds[1]), "AVE", font=font, fill="#f97316")
     return image
 
 

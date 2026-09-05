@@ -65,6 +65,8 @@ class YoutubeDL:
             arguments.append("--skip-download")
         if value.get("writeinfojson"):
             arguments.append("--write-info-json")
+        if value.get("writecomments"):
+            arguments.append("--write-comments")
         if output := value.get("outtmpl"):
             arguments.extend(["--output", str(output)])
         if format_selector := value.get("format"):
@@ -92,6 +94,8 @@ class YoutubeDL:
         youtube_args = extractor_args.get("youtube") or {}
         if clients := youtube_args.get("player_client"):
             arguments.extend(["--extractor-args", f"youtube:player_client={','.join(clients)}"])
+        if comment_sort := youtube_args.get("comment_sort"):
+            arguments.extend(["--extractor-args", f"youtube:comment_sort={','.join(comment_sort)}"])
         runtimes = value.get("js_runtimes") or {}
         if "node" in runtimes:
             arguments.extend(["--js-runtimes", "node"])

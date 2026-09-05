@@ -73,13 +73,14 @@ class YouTubeImporter:
         self.media_root = media_root or get_media_root()
 
     async def import_video(self, url: str, job_id: str | None = None) -> dict:
-        return await asyncio.to_thread(self._import_video_sync, url, job_id)
+        return await asyncio.to_thread(self.prepare_source_video, url, job_id)
 
-    def _import_video_sync(self, url: str, job_id: str | None = None) -> dict:
+    def prepare_source_video(self, url: str, job_id: str | None = None) -> dict:
+        """원본 영상을 준비하거나 이미 확보한 ``yt-data`` 자료를 재사용한다."""
         if not is_youtube_url(url):
             raise InvalidYouTubeURLError("Only YouTube URLs are supported.")
         job_id = job_id or uuid4().hex
-        cached = self._find_complete_cached_import(url, job_id)
+        cached = self.find_complete_cached_import(url, job_id)
         if cached is not None:
             return cached
         video_id = self._video_id_from_url(url)
@@ -93,14 +94,21 @@ class YouTubeImporter:
         if not prefer_merged_formats:
             warnings.append(FFMPEG_MISSING_WARNING)
 
+        existing_subtitles = [
+            path
+            for path in self._find_files(job_dir, SUBTITLE_EXTENSIONS, recursive=True)
+            if path.suffix.lower() == ".vtt" and path.stat().st_size > 0
+        ]
         info = self._download_with_fallbacks(
             url,
             job_dir,
+            include_subtitles=not bool(existing_subtitles),
+            write_info_json=not self._has_cached_info(job_dir),
             prefer_merged_formats=prefer_merged_formats,
             warnings=warnings,
         )
 
-        subtitle_files = self._find_files(job_dir, SUBTITLE_EXTENSIONS)
+        subtitle_files = self._find_files(job_dir, SUBTITLE_EXTENSIONS, recursive=True)
         video_file = self._find_video_file(job_dir, info)
         metadata_path = self._write_metadata(
             job_dir,
@@ -139,7 +147,7 @@ class YouTubeImporter:
             candidate = ""
         return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate or "") else None
 
-    def _find_complete_cached_import(self, url: str, job_id: str) -> dict | None:
+    def find_complete_cached_import(self, url: str, job_id: str) -> dict | None:
         """Reuse an existing source only when both video and captions exist."""
 
         video_id = self._video_id_from_url(url)
@@ -168,7 +176,7 @@ class YouTubeImporter:
             # names retain the video ID.
             if known_id != video_id and video_id not in directory.name and not any(video_id in path.name for path in directory.iterdir() if path.is_file()):
                 continue
-            subtitles = self._find_files(directory, SUBTITLE_EXTENSIONS)
+            subtitles = self._find_files(directory, SUBTITLE_EXTENSIONS, recursive=True)
             subtitles = [
                 path
                 for path in subtitles
@@ -201,6 +209,7 @@ class YouTubeImporter:
         self,
         job_dir: Path,
         include_subtitles: bool,
+        write_info_json: bool,
         prefer_merged_formats: bool,
         player_client: str | None = None,
         use_cookies: bool = True,
@@ -218,7 +227,7 @@ class YouTubeImporter:
             # well makes one rate-limited language fail the whole extraction.
             "subtitleslangs": ["ko"] if include_subtitles else [],
             "subtitlesformat": "vtt",
-            "writeinfojson": True,
+            "writeinfojson": write_info_json,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -264,6 +273,8 @@ class YouTubeImporter:
         url: str,
         job_dir: Path,
         *,
+        include_subtitles: bool,
+        write_info_json: bool,
         prefer_merged_formats: bool,
         warnings: list[str],
     ) -> dict:
@@ -273,7 +284,8 @@ class YouTubeImporter:
         for index, client in enumerate(clients):
             options = self._build_ydl_options(
                 job_dir,
-                include_subtitles=True,
+                include_subtitles=include_subtitles,
+                write_info_json=write_info_json,
                 prefer_merged_formats=prefer_merged_formats,
                 player_client=client,
                 use_cookies=not cookies_disabled,
@@ -300,6 +312,7 @@ class YouTubeImporter:
                     fallback_options = self._build_ydl_options(
                         job_dir,
                         include_subtitles=False,
+                        write_info_json=write_info_json,
                         prefer_merged_formats=prefer_merged_formats,
                         player_client=client,
                         use_cookies=not cookies_disabled,
@@ -381,9 +394,28 @@ class YouTubeImporter:
             return None
         return max(files, key=lambda path: path.stat().st_size)
 
-    def _find_files(self, directory: Path, extensions: set[str]) -> list[Path]:
+    @staticmethod
+    def _has_cached_info(job_dir: Path) -> bool:
+        """Use phase-one info only when it is a readable yt-dlp JSON object."""
+
+        for path in job_dir.glob("*.info.json"):
+            try:
+                if isinstance(json.loads(path.read_text(encoding="utf-8")), dict):
+                    return True
+            except (OSError, json.JSONDecodeError):
+                continue
+        return False
+
+    def _find_files(
+        self,
+        directory: Path,
+        extensions: set[str],
+        *,
+        recursive: bool = False,
+    ) -> list[Path]:
+        paths = directory.rglob("*") if recursive else directory.glob("*")
         return sorted(
             path
-            for path in directory.glob("*")
+            for path in paths
             if path.is_file() and path.suffix.lower() in extensions
         )
